@@ -54,7 +54,7 @@ def load_stage2():
     data = STAGE2_PATH.read_bytes()
 
     print()
-    print("[Stage2 verification]")
+    print("[DA2] Patched Stage-2 verification")
     print(f"  path    = {STAGE2_PATH}")
     print(f"  address = 0x{STAGE2_ADDR:08X}")
     print(f"  length  = 0x{len(data):X}")
@@ -98,7 +98,7 @@ def send_stage2_data(ep_out, ep_in, data):
     )
 
     print()
-    print("[Stage2 data packet]")
+    print("[DA2] Data packet")
     print(
         f"  TX hdr: magic=0x{s3g.MAGIC:08X} "
         f"type={s3g.DT_PROTOCOL_FLOW} "
@@ -161,19 +161,19 @@ def send_stage2_data(ep_out, ep_in, data):
 
     if status != 0:
         raise RuntimeError(
-            "Stage2 data was rejected: "
+            "DA2 data was rejected: "
             f"0x{status:08X}"
         )
 
     print(
-        "  Stage2 upload acceptance: PASS"
+        "  DA2 upload acceptance: PASS"
     )
 
 
 def boot_stage2(ep_out, ep_in, stage2):
     print()
     print("=" * 72)
-    print("STAGE 3I — BOOT WIKO XFLASH STAGE 2")
+    print("DA2 — BOOT WIKO XFLASH STAGE-2")
     print("=" * 72)
 
     print(
@@ -252,7 +252,7 @@ def boot_stage2(ep_out, ep_in, stage2):
     # Next packet must be the actual Stage2 data.
 
     print()
-    print("[3] Sending unsigned Stage2 image")
+    print("[3] Sending patched DA2 image")
 
     send_stage2_data(
         ep_out,
@@ -265,7 +265,7 @@ def boot_stage2(ep_out, ep_in, stage2):
     # ------------------------------------------------------------
 
     print()
-    print("[4] Waiting for Stage2 execution result")
+    print("[4] Waiting for DA2 execution result")
 
     time.sleep(0.5)
 
@@ -275,7 +275,7 @@ def boot_stage2(ep_out, ep_in, stage2):
         )
     except Exception as exc:
         raise RuntimeError(
-            "No valid post-BOOT_TO Stage2 status "
+            "No valid post-BOOT_TO DA2 status "
             f"received: {exc}"
         )
 
@@ -286,25 +286,25 @@ def boot_stage2(ep_out, ep_in, stage2):
 
     if final == 0:
         print(
-            "  Stage2 execution response: "
+            "  DA2 execution response: "
             "SUCCESS (0x00000000)"
         )
 
     elif final == s3g.SYNC_SIGNAL:
         print(
-            "  Stage2 execution response: "
+            "  DA2 execution response: "
             "SYNC_SIGNAL"
         )
 
     else:
         raise RuntimeError(
-            f"Unexpected Stage2 execution status "
+            f"Unexpected DA2 execution status "
             f"0x{final:08X}"
         )
 
     print()
     print(
-        "  WIKO XFLASH STAGE 2 EXECUTION: PROVEN"
+        "  WIKO XFLASH DA2 EXECUTION: PROVEN"
     )
 
 
@@ -546,7 +546,7 @@ def read_xflash_raw_packet(ep_in):
 def read_user_sector0(ep_out, ep_in):
     print()
     print("=" * 72)
-    print("STAGE 3K-C — READ GPT PARTITION ENTRIES")
+    print("GPT — READ PRIMARY PARTITION ENTRIES")
     print("=" * 72)
 
     print(f"  READ_DATA    = 0x{READ_DATA:08X}")
@@ -555,9 +555,9 @@ def read_user_sector0(ep_out, ep_in):
     print(f"  address      = 0x{READ_ADDR:016X}")
     print(f"  length       = 0x{READ_LEN:X} ({READ_LEN} bytes)")
     print()
-    print("  WRITE_DATA   = DISABLED")
-    print("  FORMAT       = DISABLED")
-    print("  ERASE        = DISABLED")
+    print("  operation    = READ-ONLY")
+    print("  FORMAT       = not used by this operation")
+    print("  ERASE        = not used by this operation")
 
     # --------------------------------------------------------
     # 1. READ_DATA command
@@ -868,7 +868,7 @@ def read_emmc_range(ep_out, ep_in, addr, size, outfile, label):
 
     print()
     print("=" * 72)
-    print(f"STAGE 3L — READ {label}")
+    print(f"STORAGE READ — {label}")
     print("=" * 72)
 
     print(f"  storage   = eMMC")
@@ -877,9 +877,9 @@ def read_emmc_range(ep_out, ep_in, addr, size, outfile, label):
     print(f"  length    = 0x{size:X} ({size / 1024 / 1024:.2f} MiB)")
     print(f"  output    = {outfile}")
     print()
-    print("  WRITE_DATA = DISABLED")
-    print("  FORMAT     = DISABLED")
-    print("  ERASE      = DISABLED")
+    print("  operation  = READ-ONLY")
+    print("  FORMAT     = not used")
+    print("  ERASE      = not used")
 
     # --------------------------------------------------------
     # READ_DATA command
@@ -2061,7 +2061,7 @@ def run_damage_sweep(ep_out, ep_in):
 
     print()
     print("=" * 72)
-    print("READ-ONLY STORAGE DAMAGE SWEEP")
+    print("READ-ONLY STORAGE SAMPLE SWEEP")
     print("=" * 72)
 
     for name, addr, size in probes:
@@ -2094,7 +2094,7 @@ def run_damage_sweep(ep_out, ep_in):
 
     print()
     print("=" * 72)
-    print("DAMAGE SWEEP SUMMARY")
+    print("STORAGE SAMPLE SWEEP SUMMARY")
     print("=" * 72)
 
     for name, addr, size, info in results:
@@ -2120,17 +2120,17 @@ def run_damage_sweep(ep_out, ep_in):
 
     print()
     print(
-        "Sweep complete. All samples were read-only."
+        "Storage sample sweep complete. All reads were read-only."
     )
 
 
 def stage2_writeverify_shell(ep_out, ep_in, emmc_info=None):
     print()
     print("=" * 72)
-    print("T408DL STAGE2 WRITE-VERIFY SHELL")
+    print("T408DL XFLASH RECOVERY SHELL")
     print("=" * 72)
     print()
-    print("Persistent XFlash Stage2 session is ACTIVE.")
+    print("Persistent XFlash DA2 session is ACTIVE.")
     print()
     print("Available commands:")
     print("  help")
@@ -2150,7 +2150,7 @@ def stage2_writeverify_shell(ep_out, ep_in, emmc_info=None):
     while True:
         try:
             line = input(
-                "stage2> "
+                "t408dl> "
             ).strip()
 
         except (EOFError, KeyboardInterrupt):
@@ -2381,30 +2381,27 @@ def main():
         "DA_SWSEC_1836_K510BG_9.0_WIK_FR_31.WRITEPATCHED.bin"
     )
 
-    print(
-        "T408DL_preloader_stage3i_boot_stage2.py"
-    )
-
-    print(
-        "Controlled Wiko XFlash Stage-2 boot"
-    )
-
+    print("TCL Flip 2 / T408DL Recovery Tool")
+    print("MediaTek MT6739 — XFlash eMMC recovery environment")
     print("=" * 72)
 
     print()
-    print("BOUNDARY:")
-    print("  - reproduce proven Stage 3C")
-    print("  - reproduce proven Stage 3E")
-    print("  - reproduce proven Stage 3F")
-    print("  - reproduce proven Stage 3G")
-    print("  - upload Stage2 to 0x40000000")
-    print("  - execute Stage2")
-    print("  - observe execution status ONLY")
-    print("  - NO GET_EMMC_INFO")
-    print("  - NO READ_DATA")
-    print("  - NO WRITE_DATA")
-    print("  - NO FORMAT")
-    print("  - NO storage operation")
+    print("PROVEN RECOVERY CHAIN:")
+    print("  - MediaTek Preloader capture and synchronization")
+    print("  - volatile S-USBDL bypass")
+    print("  - Wiko XFlash DA1 upload and execution")
+    print("  - XFlash synchronization")
+    print("  - patched XFlash DA2 upload and execution")
+    print("  - GET_EMMC_INFO")
+    print("  - READ_DATA")
+    print("  - GPT-aware WRITE_DATA with full read-back verification")
+    print()
+    print("SAFETY BOUNDARY:")
+    print("  - eMMC USER-area GPT partitions only")
+    print("  - GPT geometry validated before guarded writes")
+    print("  - full-partition image size required for write-verify")
+    print("  - Boot0 / Boot1 / RPMB writes are NOT enabled")
+    print("  - FORMAT / ERASE are NOT implemented")
 
     stage2 = load_stage2()
 
@@ -2419,7 +2416,7 @@ def main():
     try:
         print()
         print(
-            "[Stage 1] Waiting for Preloader..."
+            "[Preloader] Waiting for device..."
         )
 
         dev = stage1.wait_for_preloader()
@@ -2467,7 +2464,7 @@ def main():
         # --------------------------------------------------------
 
         print()
-        print("[Stage 3F] JUMP_DA")
+        print("[DA1] Executing JUMP_DA")
 
         s3f.jump_da_only(
             ep_out,
@@ -2487,11 +2484,11 @@ def main():
 
         if first != b"\xC0":
             raise RuntimeError(
-                "Expected Stage1 C0 marker"
+                "Expected DA1 C0 marker"
             )
 
         print(
-            "  Stage1 C0 marker: PASS"
+            "  DA1 C0 marker: PASS"
         )
 
         # --------------------------------------------------------
@@ -2515,7 +2512,7 @@ def main():
 
         print()
         print("=" * 72)
-        print("STAGE 3J — eMMC IDENTIFICATION")
+        print("STORAGE — eMMC IDENTIFICATION")
         print("=" * 72)
         print("  GET_EMMC_INFO only")
         print("  NO READ_DATA")
@@ -2539,11 +2536,11 @@ def main():
 
         print()
         print("=" * 72)
-        print("STAGE2 WRITE-VERIFY SHELL CLOSED")
+        print("T408DL XFLASH RECOVERY SHELL CLOSED")
         print("=" * 72)
 
         print(
-            "Wiko XFlash Stage 2 was uploaded "
+            "Wiko XFlash DA2 was uploaded "
             "and executed."
         )
 
@@ -2568,7 +2565,7 @@ def main():
         print()
         print("=" * 72)
         print(
-            "STAGE 3I ABORTED / FAILED CLOSED"
+            "DA2 BOOT ABORTED / FAILED CLOSED"
         )
         print("=" * 72)
         print(

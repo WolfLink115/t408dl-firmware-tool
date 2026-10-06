@@ -177,7 +177,7 @@ def send_param(ep_out, ep_in, payload):
 def perform_xflash_sync(ep_out, ep_in):
     print()
     print("=" * 72)
-    print("STAGE 3G — XFLASH SYNCHRONIZATION")
+    print("XFLASH — SYNCHRONIZATION")
     print("=" * 72)
 
     # ------------------------------------------------------------
@@ -298,18 +298,18 @@ def perform_xflash_sync(ep_out, ep_in):
 
 def main():
     print(
-        "T408DL_preloader_stage3g_xflash_sync.py"
+        "TCL Flip 2 / T408DL XFlash Synchronization Test"
     )
     print(
-        "Stage 3G: synchronize Wiko XFlash Stage 1"
+        "Synchronize Wiko XFlash DA1"
     )
     print("=" * 72)
 
     print()
     print("BOUNDARY:")
-    print("  - reproduce proven Stage 3C")
-    print("  - reproduce proven Stage 3E")
-    print("  - reproduce proven Stage 3F")
+    print("  - apply proven volatile S-USBDL bypass")
+    print("  - upload accepted Wiko XFlash DA1")
+    print("  - execute DA1 through JUMP_DA")
     print("  - complete XFlash startup sync")
     print("  - NO GET_EMMC_INFO")
     print("  - NO storage enumeration")
@@ -327,7 +327,7 @@ def main():
 
     try:
         print()
-        print("[Stage 1] Waiting for Preloader...")
+        print("[Preloader] Waiting for device...")
 
         dev = stage1.wait_for_preloader()
 
@@ -365,7 +365,7 @@ def main():
         )
 
         print()
-        print("[Stage 3F] JUMP_DA")
+        print("[DA1] JUMP_DA")
 
         s3f.jump_da_only(
             ep_out,
@@ -375,7 +375,7 @@ def main():
         # We intentionally reproduce the exact proven 3F observation,
         # but this time retain the session and proceed with XFlash sync.
         print()
-        print("[Stage 3F] Waiting for C0")
+        print("[DA1] Waiting for C0")
 
         first = read_exact(
             ep_in,
@@ -402,10 +402,10 @@ def main():
 
         print()
         print("=" * 72)
-        print("STAGE 3G SUCCESS")
+        print("XFLASH SYNCHRONIZATION SUCCESS")
         print("=" * 72)
         print(
-            "Wiko XFlash Stage 1 synchronized successfully."
+            "Wiko XFlash DA1 synchronized successfully."
         )
         print(
             "Final DA response contained SYNC_SIGNAL."
@@ -427,7 +427,7 @@ def main():
     except Exception as exc:
         print()
         print("=" * 72)
-        print("STAGE 3G ABORTED / FAILED CLOSED")
+        print("XFLASH SYNCHRONIZATION ABORTED / FAILED CLOSED")
         print("=" * 72)
         print(f"ERROR: {exc}")
         print()

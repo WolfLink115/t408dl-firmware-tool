@@ -74,7 +74,7 @@ def write_exact(ep_out, data, timeout=USB_TIMEOUT_MS):
 
 def locate_stage1(da_path: Path) -> bytes:
     print()
-    print("[DA] Loading Wiko DA")
+    print("[DA1] Loading Wiko XFlash DA package")
     print(f"  path = {da_path}")
 
     if not da_path.is_file():
@@ -167,7 +167,7 @@ def send_da_stage1(ep_out, ep_in, payload):
 
     print()
     print("=" * 72)
-    print("STAGE 3E-B — WIKO XFLASH STAGE-1 SEND_DA")
+    print("DA1 — WIKO XFLASH STAGE-1 SEND_DA")
     print("=" * 72)
 
     print(
@@ -191,7 +191,7 @@ def send_da_stage1(ep_out, ep_in, payload):
         f"0x{host_checksum:04X}"
     )
     print()
-    print("  JUMP_DA = DISABLED")
+    print("  JUMP_DA = not issued by this step")
 
     # -----------------------------------------------------------
     # SEND_DA opcode
@@ -531,17 +531,17 @@ def verify_after_send(ep_out, ep_in):
 
 def main():
     print(
-        "T408DL_preloader_stage3e_wiko_stage1.py"
+        "TCL Flip 2 / T408DL DA1 Upload Test"
     )
     print(
-        "Stage 3E-B: upload real Wiko xflash Stage 1"
+        "Upload real Wiko XFlash DA1"
     )
     print("=" * 72)
 
     print()
     print("BOUNDARY:")
     print(
-        "  - reproduce proven Stage 3C"
+        "  - apply proven volatile S-USBDL bypass"
     )
     print(
         "  - SEND_DA actual Wiko Stage 1"
@@ -572,7 +572,7 @@ def main():
 
     try:
         print()
-        print("[Stage 1] Waiting for Preloader...")
+        print("[Preloader] Waiting for device...")
 
         dev = stage1.wait_for_preloader()
 
@@ -636,7 +636,7 @@ def main():
 
         print()
         print(
-            "[Stage 3C] Zeroing S-USBDL..."
+            "[Security] Zeroing S-USBDL..."
         )
 
         s3c.d3_write_replay(
@@ -712,10 +712,10 @@ def main():
 
         print()
         print("=" * 72)
-        print("STAGE 3E-B SUCCESS")
+        print("DA1 UPLOAD SUCCESS")
         print("=" * 72)
         print(
-            "Real Wiko xflash Stage 1 was accepted."
+            "Wiko XFlash DA1 was accepted."
         )
         print(
             "Device checksum matched host checksum."
@@ -751,7 +751,7 @@ def main():
         print()
         print("=" * 72)
         print(
-            "STAGE 3E-B ABORTED / FAILED CLOSED"
+            "DA1 UPLOAD ABORTED / FAILED CLOSED"
         )
         print("=" * 72)
         print(f"ERROR: {exc}")

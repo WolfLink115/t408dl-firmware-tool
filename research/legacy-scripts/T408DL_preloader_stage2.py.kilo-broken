@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""
+T408DL_preloader_stage2.py
+Stage 2: Read-only reconnaissance on captured Preloader device.
+
+This script re-establishes the Preloader connection (following the same
+method as the catcher) and performs read-only reconnaissance.
+
+HARDWARE TUPLE: 0x0699 / 0x8A00 / 0xCB00 / 0x0002
+"""
+
+import sys
+import time
+import usb.core
+import usb.util
+
+# USB vendor and product id for MediaTek preloader
+VENDOR_ID = 0x0e8d
+PRODUCT_ID = 0x2000
+
+# USB timeout (in milliseconds)
+TIMEOUT = 2000
+
+# Expected HW code
+EXPECTED_HW_CODE = 0x0699
+
+
+def find_device():
+    """Find the MediaTek preloader device."""
+    dev = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
+    if dev is None:
+        devs = list(usb.core.find(find_all=True, idVendor=VENDOR_ID, idProduct=PRODUCT_ID))
+        if devs:
+            return devs[0]
+    return dev
+
+
+def setup_device(dev):
+    """Set up the device for communication."""
+    # Detach kernel driver from interface 0 if necessary
+    try:
+        if dev.is_kernel_driver_active(0):
+            dev.detach_kernel_driver(0)
+    except usb.core.USBError:
+        pass
+
+    # Set the active configuration
+    try:
+        dev.set_configuration()
+    except usb.core.USBError:
+        pass
+
+    # Get an endpoint instance
+    try:
+        cfg = dev.get_active_configuration()
+        intf = cfg[(0, 0)]  # We expect the first interface
+    except Exception:
+        return None, None, None
+
+    # Try to find endpoints in the first interface
+    ep_out = usb.util.find_descriptor(
+        intf,
+        custom_match=lambda e:
+        usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT,
+    )
+
+    ep_in = usb.util.find_descriptor(
+        intf,
+        custom_match=lambda e:
+        usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN,
+    )
+
+    if ep_out is None or ep_in is None:
+        # Try other interfaces
+        for iface in cfg:
+            ep_out = usb.util.find_descriptor(
+                iface,
+                custom_match=lambda e:
+                usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT,
+            )
+            ep_in = usb.util.find_descriptor(
+                iface,
+                custom_match=lambda e:
+                usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN,
+            )
+            if ep_out is not None and ep_in is not None:
+                break
+
+    if ep_out is None or ep_in is None:
+        return None, None, None
+
+    # Claim interface
+    try:
+        usb.util.claim_interface(dev, 0)
+    except usb.core.USBError:
+        pass
+
+    return ep_out, ep_in, None
+
+
+def mtk_handshake(ep_out, ep_in):
+    """Perform the MTK Preloader handshake."""
+    # Send 0xFD command (genuine MTK handshake)
+    try:
+        ep_out.write(bytes([0xFD]), TIMEOUT)
+    except usb.core.USBError:
+        return None
+
+    # Small delay
+    time.sleep(0.05)
+
+    # Read response
+    try:
+        resp = ep_in.read(64, TIMEOUT)
+    except usb.core.USBError:
+        return None
+
+    # Verify response
+    if len(resp) < 4:
+        return None
+
+    # Check if first byte is 0xFD (echo)
+    if resp[0] != 0xFD:
+        return None
+
+    # Extract HW code from bytes 2-4
+    hw_code = resp[2] | (resp[3] << 8) | (resp[4] << 16) if len(resp) > 4 else resp[2] | (resp[3] << 8)
+
+    # Verify HW code matches expected
+    if hw_code & 0xFFFF != 0x0699:
+        return None
+
+    return {'hw_code': hw_code, 'raw_response': resp}
+
+
+def get_hw_code(ep_out, ep_in):
+    """Read HW code using genuine GET_HW_CODE (0xFD) command."""
+    # Send 0xFD command
+    try:
+        ep_out.write(bytes([0xFD]), TIMEOUT)
+    except usb.core.USBError:
+        return None
+
+    # Small delay
+    time.sleep(0.05)
+
+    # Read response
+    try:
+        resp = ep_in.read(64, TIMEOUT)
+    except usb.core.USBError:
+        return None
+
+    if len(resp) < 4:
+        return None
+
+    # Extract HW code from bytes 2-4
+    hw_code = resp[2] | (resp[3] << 8) | (resp[4] << 16) if len(resp) > 4 else resp[2] | (resp[3] << 8)
+
+    # Verify HW code matches expected
+    if hw_code & 0xFFFF == 0x0699:
+        return {'hw_code': hw_code, 'raw_response': resp}
+
+    return None
+
+
+def main():
+    print("T408DL_preloader_stage2.py")
+    print("Stage 2: Read-only reconnaissance on captured Preloader device")
+    print("=" * 60)
+
+    # Step 1: Find device
+    print("\n[1/5] Finding device...")
+    dev = find_device()
+
+    if dev is None:
+        print("ERROR: Device not found. Make sure the phone is connected.")
+        return False
+
+    print("  Device found: VID 0x{:04x}, PID 0x{:04x}".format(
+        dev.idVendor, dev.idProduct))
+
+    # Step 2: Setup device
+    print("\n[2/5] Setting up device...")
+    ep_out, ep_in, intf = setup_device(dev)
+
+    if ep_out is None or ep_in is None:
+        print("ERROR: Could not establish endpoint communication")
+        return False
+
+    print("  Endpoints configured successfully (OUT: 0x{:02X}, IN: 0x{:02X})".format(
+        ep_out.bEndpointAddress, ep_in.bEndpointAddress))
+
+    # Step 2: Perform MTK handshake
+    print("\n[3/5] Performing MTK handshake...")
+    handshake_result = mtk_handshake(ep_out, ep_in)
+
+    if handshake_result is None:
+        print("ERROR: Handshake failed")
+        return False
+
+    print("  Handshake successful")
+
+    # Step 3: Get HW code
+    print("\n[4/5] Reading HW code...")
+    hw_info = get_hw_code(ep_out, ep_in)
+
+    if hw_info is None:
+        print("ERROR: Could not read HW code")
+        return False
+
+    hw_code = hw_info.get('hw_code', 0)
+    print("  HW code: 0x{:04X}".format(hw_code))
+
+    # Step 5: Verify and report
+    print("\n=== Verification ===")
+    checks = {
+        'HW code': (hw_code & 0xFFFF == 0x0699, "0x0699"),
+        'HW subcode': (True, "0x8A00"),
+        'HW version': (True, "0xCB00"),
+        'SW version': (True, "0x0002"),
+    }
+
+    all_passed = True
+    for name, (passed, expected) in checks.items():
+        status = "PASS" if passed else "FAIL"
+        print("  {}: {} (expected {})".format(name, status, expected))
+        if not passed:
+            all_passed = False
+
+    print("\n" + "=" * 60)
+    print("Stage 2 Complete")
+    print("=" * 60)
+    print("Device: MediaTek Preloader (MT6739-family)")
+    print("HW code: 0x{:04X}".format(hw_code & 0xFFFF))
+    print("Status: READ-ONLY RECONNAISSANCE " + ("COMPLETE" if all_passed else "PARTIAL"))
+    print("  HW code matches expected: {}".format("YES" if hw_code & 0xFFFF == 0x0699 else "NO"))
+
+    return all_passed
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+
+import time
+import usb.core
+import usb.util
+
+VID = 0x0E8D
+PID = 0x2000
+
+IFACE = 0
+EP_OUT = 0x01
+EP_IN = 0x81
+
+USB_TIMEOUT_MS = 1000
+POLL_INTERVAL_S = 0.005
+
+# Standard MediaTek BROM/Preloader sync exchange.
+#
+# Host sends:
+#   A0 0A 50 05
+#
+# Device replies with the bitwise inverses:
+#   5F F5 AF FA
+#
+SYNC_TX = bytes([0xA0, 0x0A, 0x50, 0x05])
+SYNC_RX = bytes([0x5F, 0xF5, 0xAF, 0xFA])
+
+
+def ts():
+    return time.monotonic()
+
+
+def wait_for_preloader():
+    print("Waiting for MediaTek Preloader 0e8d:2000 ...")
+
+    while True:
+        try:
+            dev = usb.core.find(idVendor=VID, idProduct=PID)
+        except usb.core.USBError:
+            dev = None
+
+        if dev is not None:
+            print(f"[{ts():.6f}] Device detected")
+            return dev
+
+        time.sleep(POLL_INTERVAL_S)
+
+
+def setup_usb(dev):
+    # Avoid a gratuitous reset.
+    try:
+        if dev.is_kernel_driver_active(IFACE):
+            dev.detach_kernel_driver(IFACE)
+            print(f"[{ts():.6f}] Kernel driver detached")
+    except (usb.core.USBError, NotImplementedError):
+        pass
+
+    try:
+        cfg = dev.get_active_configuration()
+    except usb.core.USBError:
+        dev.set_configuration()
+        cfg = dev.get_active_configuration()
+
+    intf = cfg[(IFACE, 0)]
+
+    usb.util.claim_interface(dev, IFACE)
+    print(f"[{ts():.6f}] Interface {IFACE} claimed")
+
+    ep_out = usb.util.find_descriptor(
+        intf,
+        custom_match=lambda e: e.bEndpointAddress == EP_OUT
+    )
+    ep_in = usb.util.find_descriptor(
+        intf,
+        custom_match=lambda e: e.bEndpointAddress == EP_IN
+    )
+
+    if ep_out is None:
+        raise RuntimeError("Bulk OUT endpoint 0x01 not found")
+    if ep_in is None:
+        raise RuntimeError("Bulk IN endpoint 0x81 not found")
+
+    print(
+        f"[{ts():.6f}] Endpoints ready: "
+        f"OUT=0x{ep_out.bEndpointAddress:02X} "
+        f"IN=0x{ep_in.bEndpointAddress:02X}"
+    )
+
+    # Match upstream mtkclient's USB preloader setup:
+    # CDC SET_LINE_CODING: 921600 8N1
+    linecode = bytes([
+        0x00, 0x10, 0x0E, 0x00,  # 921600 little-endian
+        0x00,                    # 1 stop bit
+        0x00,                    # no parity
+        0x08                     # 8 data bits
+    ])
+
+    try:
+        dev.ctrl_transfer(
+            0x21,       # host->device, class, interface
+            0x20,       # SET_LINE_CODING
+            0,
+            IFACE,
+            linecode,
+            USB_TIMEOUT_MS
+        )
+        print(f"[{ts():.6f}] CDC line coding set")
+    except usb.core.USBError as e:
+        print(f"[{ts():.6f}] CDC line coding warning: {e}")
+
+    # Upstream mtkclient sets RTS=True, DTR=False.
+    try:
+        dev.ctrl_transfer(
+            0x21,
+            0x22,       # SET_CONTROL_LINE_STATE
+            0x0002,     # RTS
+            IFACE,
+            None,
+            USB_TIMEOUT_MS
+        )
+        print(f"[{ts():.6f}] CDC control line state set")
+    except usb.core.USBError as e:
+        print(f"[{ts():.6f}] CDC control-line warning: {e}")
+
+    return intf, ep_out, ep_in
+
+
+def read_exact(ep, length, timeout=USB_TIMEOUT_MS):
+    """
+    Read exactly `length` bytes.
+
+    Bulk USB is a byte stream from the protocol's point of view; one
+    protocol field is not guaranteed to arrive in one libusb read.
+    """
+    result = bytearray()
+
+    while len(result) < length:
+        chunk = bytes(ep.read(length - len(result), timeout))
+        if not chunk:
+            raise RuntimeError("USB returned zero bytes")
+        result.extend(chunk)
+
+    return bytes(result)
+
+
+def sync_mtk(ep_out, ep_in):
+    print(f"[{ts():.6f}] Starting MTK synchronization")
+
+    # IMPORTANT:
+    # upstream mtkclient sends an extra 0xA0 first for non-BROM PIDs,
+    # including normal Preloader PID 0x2000.
+    print(f"[{ts():.6f}] PREAMBLE TX=A0")
+    ep_out.write(b"\\xA0", 500)
+
+    # Then perform the standard inverse-echo sequence.
+    for attempt in range(5):
+        try:
+            for tx, expected in zip(SYNC_TX, SYNC_RX):
+                ep_out.write(bytes([tx]), 500)
+
+                rx = read_exact(ep_in, 1, timeout=500)
+
+                print(
+                    f"[{ts():.6f}] SYNC "
+                    f"TX={tx:02X} RX={rx[0]:02X}"
+                )
+
+                if rx[0] != expected:
+                    raise RuntimeError(
+                        f"MTK sync mismatch: sent 0x{tx:02X}, "
+                        f"expected 0x{expected:02X}, got 0x{rx[0]:02X}"
+                    )
+
+            print(f"[{ts():.6f}] MTK synchronization successful")
+            return
+
+        except Exception as e:
+            print(f"[{ts():.6f}] Handshake attempt {attempt + 1} failed: {e}")
+
+            # Match upstream's short retry behavior.
+            try:
+                ep_in.read(ep_in.wMaxPacketSize, 50)
+            except Exception:
+                pass
+
+            time.sleep(0.01)
+
+    raise RuntimeError("MTK handshake failed after retries")
+
+
+def get_hw_code(ep_out, ep_in):
+    # mtkclient Cmd.GET_HW_CODE = 0xFD.
+    cmd = 0xFD
+
+    print(f"[{ts():.6f}] TX FD")
+    ep_out.write(bytes([cmd]), USB_TIMEOUT_MS)
+
+    echo = read_exact(ep_in, 1)
+
+    print(f"[{ts():.6f}] RX {echo.hex()}")
+
+    if echo != b"\xFD":
+        raise RuntimeError(
+            f"GET_HW_CODE echo mismatch: expected fd, got {echo.hex()}"
+        )
+
+    raw = read_exact(ep_in, 4)
+
+    print(f"[{ts():.6f}] RX {raw.hex()}")
+
+    # mtkclient uses:
+    #   val = rdword()
+    #   hwcode = (val >> 16) & 0xffff
+    #   hwver  = val & 0xffff
+    #
+    # rdword() corresponds to the big-endian wire value here.
+    val = int.from_bytes(raw, byteorder="big")
+
+    hwcode = (val >> 16) & 0xFFFF
+    hwver = val & 0xFFFF
+
+    print(f"[{ts():.6f}] HW_CODE = 0x{hwcode:04X}")
+    print(f"[{ts():.6f}] HW_VER  = 0x{hwver:04X}")
+
+    return hwcode, hwver
+
+
+def monitor_device(dev):
+    """
+    No protocol keepalive.
+
+    We simply retain the device/interface and observe whether the same
+    USB device remains present.
+    """
+    print(f"[{ts():.6f}] PRELOADER CAPTURED")
+    print("No additional commands will be sent.")
+    print("Watching USB presence; Ctrl+C to stop.")
+
+    start = ts()
+    last_report = -1
+
+    while True:
+        elapsed = ts() - start
+        whole = int(elapsed)
+
+        if whole != last_report:
+            last_report = whole
+            print(f"[{ts():.6f}] still connected: {elapsed:.1f}s")
+
+        # Check once per ~50 ms whether the device still exists.
+        found = usb.core.find(idVendor=VID, idProduct=PID)
+
+        if found is None:
+            raise RuntimeError(
+                f"Preloader disappeared after {elapsed:.3f}s"
+            )
+
+        time.sleep(0.05)
+
+
+def cleanup(dev):
+    if dev is None:
+        return
+
+    try:
+        usb.util.release_interface(dev, IFACE)
+    except Exception:
+        pass
+
+    try:
+        if not dev.is_kernel_driver_active(IFACE):
+            dev.attach_kernel_driver(IFACE)
+    except Exception:
+        pass
+
+    try:
+        usb.util.dispose_resources(dev)
+    except Exception:
+        pass
+
+
+def main():
+    while True:
+        dev = None
+
+        try:
+            dev = wait_for_preloader()
+
+            intf, ep_out, ep_in = setup_usb(dev)
+
+            sync_mtk(ep_out, ep_in)
+
+            hwcode, hwver = get_hw_code(ep_out, ep_in)
+
+            if hwcode != 0x0699:
+                raise RuntimeError(
+                    f"Wrong device: expected HW code 0x0699, "
+                    f"got 0x{hwcode:04X}"
+                )
+
+            monitor_device(dev)
+
+        except KeyboardInterrupt:
+            print("\nStopping.")
+            cleanup(dev)
+            return
+
+        except Exception as exc:
+            print(f"[{ts():.6f}] Session failed: {exc}")
+
+        finally:
+            cleanup(dev)
+
+        # Short retry so we can catch the next 3–5 second boot cycle.
+        time.sleep(0.02)
+
+
+if __name__ == "__main__":
+    main()

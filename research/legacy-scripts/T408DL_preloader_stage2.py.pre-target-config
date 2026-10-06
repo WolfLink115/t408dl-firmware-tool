@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+
+"""
+T408DL_preloader_stage2.py
+
+Stage 2 bootstrap for TCL Flip 2 / T408DL.
+
+IMPORTANT:
+Stage 1 is provided by T408DL_preloader_catcher.py and is considered
+PROVEN WORKING.
+
+This file deliberately does NOT reimplement:
+    - USB enumeration
+    - CDC setup
+    - MTK synchronization
+    - GET_HW_CODE framing
+
+It imports and calls the working Stage 1 implementation in-process so
+the same USB handle/endpoints remain available for Stage 2.
+"""
+
+import sys
+import time
+
+try:
+    import T408DL_preloader_catcher as stage1
+except ImportError as exc:
+    print("ERROR: Could not import T408DL_preloader_catcher.py")
+    print(f"       {exc}")
+    print()
+    print("Run this script from the directory containing:")
+    print("  T408DL_preloader_catcher.py")
+    sys.exit(1)
+
+
+EXPECTED_HW_CODE = 0x0699
+
+
+def stage2_readonly_recon(dev, ep_out, ep_in):
+    """
+    Stage 2 read-only reconnaissance.
+
+    For now, only report data that has ACTUALLY been queried from this
+    live session. Do not fake PASS results for values we did not read.
+    """
+
+    print()
+    print("=" * 68)
+    print("STAGE 2: READ-ONLY RECONNAISSANCE")
+    print("=" * 68)
+
+    #
+    # The working Stage 1 GET_HW_CODE implementation is safe to reuse.
+    #
+    print("\n[Stage 2.1] Re-reading HW code through established session...")
+
+    hwcode, hwver = stage1.get_hw_code(ep_out, ep_in)
+
+    print()
+    print("Live values actually queried:")
+    print(f"  HW code : 0x{hwcode:04X}")
+    print(f"  HW ver  : 0x{hwver:04X}")
+
+    if hwcode != EXPECTED_HW_CODE:
+        raise RuntimeError(
+            f"Hardware gate failed: expected 0x{EXPECTED_HW_CODE:04X}, "
+            f"received 0x{hwcode:04X}"
+        )
+
+    print()
+    print("  HW_CODE verification: PASS")
+
+    #
+    # Do NOT claim the following values have been verified yet.
+    #
+    print()
+    print("Known expected values from previous mtkclient sessions")
+    print("(NOT re-queried by this Stage 2 build yet):")
+    print("  HW subcode : 0x8A00")
+    print("  HW version : 0xCB00")
+    print("  SW version : 0x0002")
+    print()
+    print("These remain EXPECTED/REFERENCE values, not Stage-2 PASS results.")
+
+    print()
+    print("=" * 68)
+    print("STAGE 2 BOOTSTRAP SUCCESS")
+    print("=" * 68)
+    print("The proven Stage 1 session remains active.")
+    print("No D0, D3, DA, memory write, crash, or exploit command was sent.")
+    print()
+    print("Holding the same Preloader USB session.")
+    print("Press Ctrl+C to release it.")
+
+    start = time.monotonic()
+    last_second = -1
+
+    while True:
+        elapsed = time.monotonic() - start
+        sec = int(elapsed)
+
+        if sec != last_second:
+            last_second = sec
+            print(
+                f"[{stage1.ts():.6f}] "
+                f"Stage 2 session still held: {elapsed:.1f}s"
+            )
+
+        #
+        # Deliberately do NOT send a protocol keepalive.
+        #
+        # Stage 1 already proved that merely maintaining the legitimate
+        # Preloader session is sufficient to keep the device captured.
+        #
+        time.sleep(0.1)
+
+
+def main():
+    dev = None
+
+    print("T408DL_preloader_stage2.py")
+    print("Stage 2 using VERIFIED Stage 1 catcher")
+    print("=" * 68)
+    print()
+    print("IMPORTANT:")
+    print("  Do NOT run T408DL_preloader_catcher.py separately.")
+    print("  This program imports it and uses the same process/session.")
+    print()
+
+    try:
+        #
+        # ------------------------------------------------------------
+        # STAGE 1
+        # ------------------------------------------------------------
+        # These are the EXACT working catcher functions.
+        # We do not reproduce or modify their implementation here.
+        #
+        print("[Stage 1] Waiting for and capturing Preloader...")
+
+        dev = stage1.wait_for_preloader()
+
+        print("[Stage 1] Setting up proven USB path...")
+        intf, ep_out, ep_in = stage1.setup_usb(dev)
+
+        print("[Stage 1] Performing proven MTK synchronization...")
+        stage1.sync_mtk(ep_out, ep_in)
+
+        print("[Stage 1] Verifying device identity...")
+        hwcode, hwver = stage1.get_hw_code(ep_out, ep_in)
+
+        if hwcode != EXPECTED_HW_CODE:
+            raise RuntimeError(
+                f"Wrong device: expected HW_CODE 0x{EXPECTED_HW_CODE:04X}, "
+                f"got 0x{hwcode:04X}"
+            )
+
+        print()
+        print("************************************************************")
+        print("STAGE 1 VERIFIED")
+        print(f"HW_CODE = 0x{hwcode:04X}")
+        print("Same live USB session will now be passed directly to Stage 2.")
+        print("************************************************************")
+
+        #
+        # ------------------------------------------------------------
+        # STAGE 2
+        # ------------------------------------------------------------
+        #
+        stage2_readonly_recon(dev, ep_out, ep_in)
+
+    except KeyboardInterrupt:
+        print("\nStopping cleanly.")
+
+    except Exception as exc:
+        print()
+        print(f"ERROR: {exc}")
+        return 1
+
+    finally:
+        if dev is not None:
+            print("Releasing Preloader USB session...")
+            stage1.cleanup(dev)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

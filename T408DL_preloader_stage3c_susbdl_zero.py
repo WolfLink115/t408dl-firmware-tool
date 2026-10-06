@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-T408DL_preloader_stage3c_susbdl_zero.py
+TCL Flip 2 / T408DL S-USBDL Bypass Test
 
 Stage 3C for TCL Flip 2 / T408DL (MT6739-family).
 
@@ -362,7 +362,7 @@ def build_stage3c_replay(wire, low):
         raise RuntimeError("Replay itself would directly reach S-USBDL; refusing")
 
     print()
-    print("[Build] Stage 3C bounded code-reuse replay")
+    print("[Security] Building bounded S-USBDL bypass replay")
     print(f"  replay low end     = 0x{len(replay_low):08X}")
     print(f"  wire bytes         = 0x{len(replay_wire):X}")
     print(f"  D3 count           = 0x{count:X}")
@@ -380,7 +380,7 @@ def d3_write_replay(ep_out, ep_in, wire):
 
     count = len(wire) // 2
     print()
-    print("[D3] WRITE16_NO_ECHO bounded Stage 3C replay")
+    print("[Security] Applying bounded WRITE16_NO_ECHO replay")
     print("  start      = 0xFFFFFFFE")
     print(f"  count      = 0x{count:X} halfwords")
     print(f"  wire bytes = 0x{len(wire):X}")
@@ -467,8 +467,8 @@ def verify_security_state(ep_out, ep_in):
 
 
 def main():
-    print("T408DL_preloader_stage3c_susbdl_zero.py")
-    print("Stage 3C: volatile S-USBDL zero + independent readback")
+    print("TCL Flip 2 / T408DL S-USBDL Bypass Test")
+    print("Volatile S-USBDL zero + independent readback")
     print("=" * 72)
     print()
     print("BOUNDARY:")
@@ -476,20 +476,20 @@ def main():
     print("  - g_da_verified must remain unchanged")
     print("  - no SEND_DA / JUMP_DA")
     print("  - no flash/storage writes")
-    print("  - Stage 1 remains untouched")
+    print("  - Preloader image remains untouched")
 
     verify_stock_image_if_present()
 
     dev = None
     try:
         print()
-        print("[Stage 1] Waiting for and capturing Preloader...")
+        print("[Preloader] Waiting for and capturing device...")
         dev = stage1.wait_for_preloader()
-        print("[Stage 1] Setting up proven USB path...")
+        print("[Preloader] Configuring USB transport...")
         intf, ep_out, ep_in = stage1.setup_usb(dev)
-        print("[Stage 1] Performing proven MTK synchronization...")
+        print("[Preloader] Synchronizing MediaTek protocol...")
         stage1.sync_mtk(ep_out, ep_in)
-        print("[Stage 1] Verifying device identity...")
+        print("[Preloader] Verifying device identity...")
         hwcode, hwver = stage1.get_hw_code(ep_out, ep_in)
 
         if hwcode != EXPECTED_HW_CODE:
@@ -514,7 +514,7 @@ def main():
 
         print()
         print("=" * 72)
-        print("ABOUT TO PERFORM VOLATILE STAGE 3C ZERO-STORE")
+        print("ABOUT TO APPLY VOLATILE S-USBDL ZERO-STORE")
         print("=" * 72)
         print(f"Target: S-USBDL word @ 0x{S_USBDL:08X} -> 0x00000000")
         print(f"Signed gadget: 0x{ZERO_STORE_GADGET:08X}")
@@ -527,7 +527,7 @@ def main():
 
         print()
         print("=" * 72)
-        print("STAGE 3C SUCCESS")
+        print("S-USBDL BYPASS SUCCESS")
         print("=" * 72)
         print("S-USBDL is independently read back as 0x00000000.")
         print("DA gate remains unchanged.")
@@ -543,7 +543,7 @@ def main():
     except Exception as exc:
         print()
         print("=" * 72)
-        print("STAGE 3C ABORTED / FAILED CLOSED")
+        print("S-USBDL BYPASS ABORTED / FAILED CLOSED")
         print("=" * 72)
         print(f"ERROR: {exc}")
         print("Do not infer an S-USBDL bypass unless independent readback is exactly zero.")

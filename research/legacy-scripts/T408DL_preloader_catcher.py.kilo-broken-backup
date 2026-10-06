@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""
+T408DL_preloader_catcher.py
+Catches and stabilizes the MediaTek Preloader enumeration window.
+
+This is NOT an exploit. It only performs normal Preloader handshake operations
+using the genuine mtkclient protocol implementation.
+
+HARDWARE TUPLE: 0x0699 / 0x8A00 / 0xCB00 / 0x0002
+"""
+
+import sys
+import time
+import usb.core
+import usb.util
+
+# USB vendor and product id for MediaTek preloader
+VENDOR_ID = 0x0e8d
+PRODUCT_ID = 0x2000
+
+# USB endpoint directions and types
+USB_DIR_OUT = 0  # to device
+USB_DIR_IN = 0x80  # to host
+
+# Endpoint endpoints (from device descriptors)
+EP_OUT_EP = 0x01  # Bulk OUT endpoint
+EP_IN_EP = 0x81   # Bulk IN endpoint (address 0x81 | USB_DIR_IN)
+
+# Timeout for USB reads (in milliseconds)
+TIMEOUT = 2000
+
+# Experiment configuration
+EXPERIMENT_STABILITY_SECONDS = [1, 2, 5, 10, 30, 60]
+EXPERIMENT_B_INTERVALS_MS = [100, 250, 500]
+
+# Global state for cleanup
+running = True
+device_handle = None
+interface_claimed = False
+interface_num = -1
+
+
+def find_device():
+    """Find the MediaTek preloader device using libusb directly."""
+    dev = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
+    return dev
+
+
+def detach_kernel_driver_safely(dev):
+    """Safely detach kernel driver from interface 0 if active."""
+    try:
+        if dev.is_kernel_driver_active(0):
+            dev.detach_kernel_driver(0)
+            return True
+    except usb.core.USBError:
+        return False
+    return False
+
+
+def set_configuration_safely(dev):
+    """Safely set the active configuration."""
+    try:
+        dev.set_configuration()
+        return True
+    except usb.core.USBError:
+        return False
+
+
+def find_endpoints(dev):
+    """Find endpoints in the active configuration."""
+    try:
+        cfg = dev.get_active_configuration()
+        intf = cfg[(0, 0)]  # We expect the first interface
+    except Exception:
+        raise ValueError('Could not get active configuration or interface')
+
+    # Try to find endpoints in the first interface without claiming it first.
+    ep_out = usb.util.find_descriptor(
+        intf,
+        custom_match=lambda e:
+        usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT,
+    )
+
+    ep_in = usb.util.find_descriptor(
+        intf,
+        custom_match=lambda e:
+        usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN,
+    )
+
+    if ep_out is None or ep_in is None:
+        found = False
+        for iface in cfg:
+            ep_out = usb.util.find_descriptor(
+                iface,
+                custom_match=lambda e:
+                usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT,
+            )
+            ep_in = usb.util.find_descriptor(
+                iface,
+                custom_match=lambda e:
+                usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN,
+            )
+            if ep_out is not None and ep_in is not None:
+                print("Found endpoints in interface %d" % iface.bInterfaceNumber)
+                intf = iface
+                found = True
+                break
+        if not found:
+            raise ValueError('Could not find endpoints')
+
+    return ep_out, ep_in, intf
+
+
+def claim_interface_safely(dev, interface_num):
+    """Safely claim an interface using the device method."""
+    try:
+        dev.claim_interface(interface_num)
+        return True
+    except usb.core.USBError:
+        return False
+
+
+def release_interface_safely(dev, interface_num):
+    """Release an interface using the device method."""
+    try:
+        dev.release_interface(interface_num)
+        return True
+    except usb.core.USBError:
+        return False
+
+
+def mtk_handshake(ep_out, ep_in):
+    """Perform the genuine MediaTek Preloader handshake.
+    
+    Based on the genuine mtkclient protocol:
+    - Send 0xFD command
+    - Device echoes 0xFD back
+    - Device sends HW code (0x06, 0x99, 0x00, 0x00)
+    """
+    # Step 1: Send 0xFD command (the genuine MTK handshake command)
+    try:
+        ep_out.write(bytes([0xFD]), TIMEOUT)
+    except usb.core.USBError:
+        return False, None
+
+    # Small delay for device to process
+    time.sleep(0.05)
+
+    # Step 2: Read the response
+    # Expected: device echoes 0xFD back, then sends HW code
+    try:
+        resp = ep_in.read(64, TIMEOUT)
+    except usb.core.USBError:
+        return False, None
+
+    # Verify the response structure:
+    # Expected: [0xFD, 0xFD, 0x06, 0x99, 0x00, 0x00, ...]
+    if len(resp) < 4:
+        return False, None
+
+    # Check if first byte is echoed (0xFD)
+    if resp[0] != 0xFD:
+        return False, None
+
+    # Check if second byte is also 0xFD (echo)
+    if len(resp) > 1 and resp[1] != 0xFD:
+        # Maybe only one echo, check if at least first byte echoed
+        pass
+
+    # Extract HW code from bytes 2-4 (0x06, 0x99, 0x00)
+    hw_code = resp[2] | (resp[3] << 8) | (resp[4] << 16) if len(resp) > 4 else resp[2] | (resp[3] << 8)
+
+    # Verify HW code matches expected 0x0699
+    hw_code_value = hw_code & 0xFFFF  # Lower 16 bits
+    if hw_code_value != 0x0699:
+        # Still accept if we got some code, just log it
+        print("HW code 0x{:04x} (expected 0x0699)".format(hw_code_value))
+
+    # Return success with the HW code info
+    hw_code_value = resp[2] | (resp[3] << 8) | (resp[4] << 16) if len(resp) > 4 else resp[2] | (resp[3] << 8)
+    return True, {'hw_code': hw_code_value, 'raw_response': resp}
+
+
+def get_hw_code(ep_out, ep_in):
+    """Read the HW code using the genuine MediaTek protocol."""
+    # Send 0xFD command (the genuine MTK handshake command)
+    try:
+        ep_out.write(bytes([0xFD]), TIMEOUT)
+    except usb.core.USBError:
+        return None
+
+    # Small delay for device to process
+    time.sleep(0.05)
+
+    # Read the response
+    try:
+        resp = ep_in.read(64, TIMEOUT)
+    except usb.core.USBError:
+        return None
+
+    # Verify response structure
+    if len(resp) < 4:
+        return None
+
+    # Extract HW code from response bytes
+    # Expected: [0xFD, 0xFD, 0x06, 0x99, ...] or similar
+    # The HW code 0x0699 should appear in bytes 2-4
+    hw_code = resp[2] | (resp[3] << 8) | (resp[4] << 16) if len(resp) > 4 else resp[2] | (resp[3] << 8)
+    
+    # Verify it matches expected HW code
+    if hw_code & 0xFFFF == 0x0699:  # Check lower 16 bits
+        return {'hw_code': hw_code, 'raw_response': resp}
+    
+    # Try alternative: just the lower 16 bits
+    if resp[2] | (resp[3] << 8) == 0x0699:
+        return {'hw_code': resp[2] | (resp[3] << 8), 'raw_response': resp}
+    
+    return None
+
+
+def release_resources(device_handle, interface_claimed, interface_num):
+    """Safely release all USB resources and re-attach kernel driver."""
+    global running
+
+    try:
+        if interface_claimed:
+            release_interface_safely(device_handle, interface_num)
+    except Exception:
+        pass
+
+    try:
+        if device_handle is not None and interface_claimed is not None:
+            try:
+                device_handle.attach_kernel_driver(interface_num)
+            except usb.core.USBError:
+                pass
+    except usb.core.USBError:
+        pass
+
+
+def main_loop():
+    """Main loop: wait for device, connect, perform handshake, run experiments."""
+    global running, device_handle, interface_claimed, claimed_interface_num
+
+    print("T408DL_preloader_catcher.py")
+    print("Waiting for MediaTek Preloader device (0x0e8d:0x2000)...")
+    print("Press Ctrl+C to terminate (will continue waiting after interrupt)")
+
+    while running:
+        try:
+            dev = find_device()
+
+            if dev is not None:
+                print("[{:.6f}] device appeared".format(time.monotonic()))
+
+                # Safe setup sequence
+                try:
+                    detach_kernel_driver_safely(dev)
+                except Exception:
+                    print("Warning: Could not detach kernel driver")
+
+                # Set configuration
+                if not set_configuration_safely(dev):
+                    print("Could not set configuration")
+                    time.sleep(1)
+                    continue
+
+                # Get endpoints
+                try:
+                    ep_out, ep_in, intf = find_endpoints(dev.get_active_configuration())
+                except ValueError:
+                    continue
+
+                # Claim interface using device method
+                claimed = False
+                try:
+                    claimed = claim_interface_safely(dev, 0)
+                except usb.core.USBError:
+                    claimed = False
+
+                if not claimed:
+                    # Fallback: try usb.util.claim_interface
+                    try:
+                        usb.util.claim_interface(intf, 0)
+                        claimed = True
+                    except (usb.core.USBError, AttributeError):
+                        claimed = False
+
+                if not claimed:
+                    print("Warning: Could not claim interface, continuing anyway")
+
+                print("[{:.6f}] interface claimed".format(time.monotonic()))
+
+                # Perform MTK handshake
+                print("Performing MTK handshake...")
+                handshake_ok, hw_info = mtk_handshake(ep_out, ep_in)
+
+                if hw_info is not None:
+                    hw_code = hw_info.get('hw_code', 0)
+                    print("GET_HW_CODE -> 0x{:08x}".format(hw_code))
+                    # Verify expected values
+                    if hw_code & 0xFFFF == 0x0699:
+                        print("HW code matches expected 0x0699")
+                    else:
+                        print("HW code 0x{:08x} (expected ~0x06990000)".format(hw_code))
+                else:
+                    print("Could not read HW code")
+
+                # Experiment A: Stability with idle periods
+                print("\n=== Stability Experiment A ===")
+                for duration in EXPERIMENT_STABILITY_SECONDS:
+                    if not running:
+                        break
+                    print("\nTesting {:.1f}s idle period...".format(duration))
+                    success = run_stability_experiment_a(ep_out, ep_in, dev, intf, duration)
+                    if not success and not running:
+                        break
+
+                print("\n=== Stability Experiment B ===")
+                for interval_ms in EXPERIMENT_B_INTERVALS_MS:
+                    if not running:
+                        break
+                    print("\nPeriodic query every {:.1f}s...".format(interval_ms / 1000.0))
+                    run_stability_experiment_b(ep_out, ep_in, interval_ms)
+
+                print("\n=== Preloader remained responsive throughout experiments ===")
+
+                print("Keeping connection alive for additional monitoring...")
+                monitor_start = time.monotonic()
+                while running:
+                    elapsed = time.monotonic() - monitor_start
+                    if elapsed > 60:
+                        print("60s monitoring complete, keeping connection...")
+                        break
+
+                    try:
+                        dev.ctrl_msg(0xA0, 6, 0, 0, 0, 1, TIMEOUT)
+                    except usb.core.USBError:
+                        pass
+
+                    time.sleep(1)
+
+                print("Monitoring session complete.")
+
+        except usb.core.USBError as e:
+            print("USB error: {}".format(e))
+        except Exception as e:
+            print("Unexpected error: {}".format(e))
+
+        time.sleep(0.5)
+
+
+if __name__ == "__main__":
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        print("\nReceived Ctrl+C, stopping...")
+        running = False
+    finally:
+        print("\nCleaning up resources...")
+        release_resources(device_handle, interface_claimed, claimed_interface_num)
+        print("Program terminated.")

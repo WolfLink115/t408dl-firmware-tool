@@ -1,5 +1,34 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
+
+# Editor / temporary files
 *.swp
+*.swo
 *.tmp
+*~
+.DS_Store
+
+# Device-specific backups
+backups/
+
+# Firmware images / dumps
+firmware/
+ota/stock/
+ota/KEE7
+ota/KEKA
+
+# Download-agent binaries
+wiko-da/
+
+# Raw research captures / logs
+research/logs/
+research/t408dl-live-lowmem.bin
+
+# Archives
+*.tar
+*.tar.gz
+*.tar.xz
+*.tar.zst
+*.zip

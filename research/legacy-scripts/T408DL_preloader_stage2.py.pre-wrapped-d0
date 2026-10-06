@@ -1,0 +1,523 @@
+#!/usr/bin/env python3
+
+"""
+T408DL_preloader_stage2.py
+
+Stage 2 bootstrap for TCL Flip 2 / T408DL.
+
+IMPORTANT:
+Stage 1 is provided by T408DL_preloader_catcher.py and is considered
+PROVEN WORKING.
+
+This file deliberately does NOT reimplement:
+    - USB enumeration
+    - CDC setup
+    - MTK synchronization
+    - GET_HW_CODE framing
+
+It imports and calls the working Stage 1 implementation in-process so
+the same USB handle/endpoints remain available for Stage 2.
+"""
+
+import sys
+import time
+
+try:
+    import T408DL_preloader_catcher as stage1
+except ImportError as exc:
+    print("ERROR: Could not import T408DL_preloader_catcher.py")
+    print(f"       {exc}")
+    print()
+    print("Run this script from the directory containing:")
+    print("  T408DL_preloader_catcher.py")
+    sys.exit(1)
+
+
+EXPECTED_HW_CODE = 0x0699
+
+
+
+def read_exact(ep, length, timeout=2000):
+    data = bytearray()
+    while len(data) < length:
+        chunk = bytes(ep.read(length - len(data), timeout))
+        if not chunk:
+            raise RuntimeError("USB returned zero bytes")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def echo_command(ep_out, ep_in, cmd):
+    ep_out.write(bytes([cmd]), 2000)
+
+    echo = read_exact(ep_in, 1)
+
+    if echo != bytes([cmd]):
+        raise RuntimeError(
+            f"Command echo mismatch: sent 0x{cmd:02X}, got {echo.hex()}"
+        )
+
+
+def get_target_config(ep_out, ep_in):
+    """
+    Read-only GET_TARGET_CONFIG (0xD8), following upstream mtkclient.
+
+    Response:
+        uint32 target_config, big-endian
+        uint16 status, big-endian
+    """
+    cmd = 0xD8
+
+    print(f"[{stage1.ts():.6f}] TX D8 (GET_TARGET_CONFIG)")
+    echo_command(ep_out, ep_in, cmd)
+
+    raw = read_exact(ep_in, 6)
+
+    target_config = int.from_bytes(raw[0:4], "big")
+    status = int.from_bytes(raw[4:6], "big")
+
+    print(f"[{stage1.ts():.6f}] RX {raw.hex()}")
+    print(f"  Target config : 0x{target_config:08X}")
+    print(f"  Status        : 0x{status:04X}")
+
+    if status != 0:
+        raise RuntimeError(
+            f"GET_TARGET_CONFIG returned status 0x{status:04X}"
+        )
+
+    decoded = {
+        "SBC": bool(target_config & 0x01),
+        "SLA": bool(target_config & 0x02),
+        "DAA": bool(target_config & 0x04),
+        "SWJTAG": bool(target_config & 0x06),
+        "EPP": bool(target_config & 0x08),
+        "CERT": bool(target_config & 0x10),
+        "MEM_READ_AUTH": bool(target_config & 0x20),
+        "MEM_WRITE_AUTH": bool(target_config & 0x40),
+        "CMD_C8_BLOCKED": bool(target_config & 0x80),
+    }
+
+    return target_config, status, decoded
+
+
+
+def echo_bytes(ep_out, ep_in, data, timeout=2000):
+    """
+    MediaTek block echo matching upstream mtkclient Port.echo():
+
+        usbwrite(val)
+        usbread(len(val))
+        compare exact response
+    """
+    ep_out.write(data, timeout)
+
+    echoed = read_exact(
+        ep_in,
+        len(data),
+        timeout=timeout
+    )
+
+    if echoed != data:
+        raise RuntimeError(
+            f"Echo mismatch: sent {data.hex()}, got {echoed.hex()}"
+        )
+
+    return echoed
+
+def get_bl_version_byte(ep_out, ep_in):
+    """
+    Probe GET_BL_VER (0xFE) exactly as upstream mtkclient does before
+    GET_ME_ID / GET_SOC_ID.
+    """
+    ep_out.write(b"\xFE", 2000)
+    res = read_exact(ep_in, 1)
+
+    print(
+        f"[{stage1.ts():.6f}] GET_BL_VER response: "
+        f"0x{res[0]:02X}"
+    )
+
+    return res[0]
+
+
+def get_variable_id(ep_out, ep_in, cmd, name):
+    """
+    Read GET_ME_ID or GET_SOC_ID following upstream mtkclient framing.
+
+    Upstream behavior:
+      TX FE
+      RX one byte
+
+    If RX == FE:
+      command is issued through BROM-style branch.
+
+    If RX > 2:
+      command is issued through Preloader-style branch.
+
+    Then:
+      TX command
+      RX command echo
+      RX uint32 BE length
+      RX payload[length]
+      RX uint16 LE status
+    """
+    blver = get_bl_version_byte(ep_out, ep_in)
+
+    if blver == 0xFE:
+        mode = "BROM-style"
+    elif blver > 2:
+        mode = "Preloader-style"
+    else:
+        raise RuntimeError(
+            f"{name}: unsupported GET_BL_VER response 0x{blver:02X}"
+        )
+
+    print(
+        f"[{stage1.ts():.6f}] {name}: "
+        f"using {mode} path"
+    )
+
+    print(f"[{stage1.ts():.6f}] TX {cmd:02X} ({name})")
+    ep_out.write(bytes([cmd]), 2000)
+
+    echo = read_exact(ep_in, 1)
+    print(f"[{stage1.ts():.6f}] RX {echo.hex()}")
+
+    if echo != bytes([cmd]):
+        raise RuntimeError(
+            f"{name}: command echo mismatch: "
+            f"expected {cmd:02x}, got {echo.hex()}"
+        )
+
+    raw_len = read_exact(ep_in, 4)
+    length = int.from_bytes(raw_len, "big")
+
+    if length <= 0 or length > 0x1000:
+        raise RuntimeError(
+            f"{name}: unreasonable returned length {length}"
+        )
+
+    payload = read_exact(ep_in, length)
+
+    # Upstream get_meid()/get_socid() explicitly parses this status LE.
+    raw_status = read_exact(ep_in, 2)
+    status = int.from_bytes(raw_status, "little")
+
+    print(
+        f"[{stage1.ts():.6f}] {name}: "
+        f"length={length}, status=0x{status:04X}"
+    )
+    print(f"  {name} = {payload.hex().upper()}")
+
+    if status != 0:
+        raise RuntimeError(
+            f"{name}: device returned status 0x{status:04X}"
+        )
+
+    return payload
+
+
+def get_meid(ep_out, ep_in):
+    return get_variable_id(
+        ep_out,
+        ep_in,
+        0xE1,
+        "ME_ID",
+    )
+
+
+def get_socid(ep_out, ep_in):
+    return get_variable_id(
+        ep_out,
+        ep_in,
+        0xE7,
+        "SOC_ID",
+    )
+
+
+def read16_d0(ep_out, ep_in, address, count=1):
+    """
+    Read-only MediaTek READ16 / D0 operation.
+
+    Mirrors upstream mtkclient read(..., length=16):
+
+      echo D0
+      echo uint32 BE address
+      echo uint32 BE count
+      RX uint16 initial status
+      RX count * uint16 data
+      RX uint16 final status
+
+    NO writes to target memory occur.
+    """
+    if count <= 0:
+        raise ValueError("READ16 count must be positive")
+
+    print(
+        f"[{stage1.ts():.6f}] "
+        f"D0 READ16 addr=0x{address:08X} count={count}"
+    )
+
+    echo_bytes(ep_out, ep_in, b"\xD0")
+    echo_bytes(ep_out, ep_in, address.to_bytes(4, "big"))
+    echo_bytes(ep_out, ep_in, count.to_bytes(4, "big"))
+
+    initial_raw = read_exact(ep_in, 2)
+    initial_status = int.from_bytes(initial_raw, "big")
+
+    print(f"  initial status = 0x{initial_status:04X}")
+
+    if initial_status > 0xFF:
+        raise RuntimeError(
+            f"D0 initial status failure: 0x{initial_status:04X}"
+        )
+
+    raw_data = read_exact(ep_in, count * 2)
+
+    words = [
+        int.from_bytes(raw_data[i:i+2], "big")
+        for i in range(0, len(raw_data), 2)
+    ]
+
+    final_raw = read_exact(ep_in, 2)
+    final_status = int.from_bytes(final_raw, "big")
+
+    print(f"  raw data       = {raw_data.hex().upper()}")
+    print(
+        "  words          = " +
+        ", ".join(f"0x{x:04X}" for x in words)
+    )
+    print(f"  final status   = 0x{final_status:04X}")
+
+    if final_status > 0xFF:
+        raise RuntimeError(
+            f"D0 final status failure: 0x{final_status:04X}"
+        )
+
+    return words, raw_data, initial_status, final_status
+
+
+def stage2_readonly_recon(dev, ep_out, ep_in):
+    """
+    Stage 2 read-only reconnaissance.
+
+    For now, only report data that has ACTUALLY been queried from this
+    live session. Do not fake PASS results for values we did not read.
+    """
+
+    print()
+    print("=" * 68)
+    print("STAGE 2: READ-ONLY RECONNAISSANCE")
+    print("=" * 68)
+
+    #
+    # The working Stage 1 GET_HW_CODE implementation is safe to reuse.
+    #
+    print("\n[Stage 2.1] Re-reading HW code through established session...")
+
+    hwcode, hwver = stage1.get_hw_code(ep_out, ep_in)
+
+    print()
+    print("Live values actually queried:")
+    print(f"  HW code : 0x{hwcode:04X}")
+    print(f"  HW ver  : 0x{hwver:04X}")
+
+    if hwcode != EXPECTED_HW_CODE:
+        raise RuntimeError(
+            f"Hardware gate failed: expected 0x{EXPECTED_HW_CODE:04X}, "
+            f"received 0x{hwcode:04X}"
+        )
+
+    print()
+    print("  HW_CODE verification: PASS")
+
+    print()
+    print("[Stage 2.2] Reading target security configuration...")
+
+    target_config, target_status, security = get_target_config(
+        ep_out, ep_in
+    )
+
+    print()
+    print("Live target-security state:")
+    for name, enabled in security.items():
+        print(f"  {name:18s}: {'YES' if enabled else 'NO'}")
+
+    #
+    # Do NOT claim the following values have been verified yet.
+    #
+    print()
+    print("[Stage 2.3] Reading SOC_ID...")
+    socid = get_socid(ep_out, ep_in)
+
+    expected_socid = bytes.fromhex(
+        "A71AC51B27FA640C7BE0C50588F7E5C8"
+        "C9309B564A15C9765DBAA3B8C72452EB"
+    )
+
+    if socid == expected_socid:
+        print("  SOC_ID verification: PASS")
+    else:
+        print("  SOC_ID verification: DIFFERENT")
+        print(f"  Expected: {expected_socid.hex().upper()}")
+        print(f"  Received: {socid.hex().upper()}")
+
+    print()
+    print("[Stage 2.4] Reading ME_ID...")
+    meid = get_meid(ep_out, ep_in)
+    print(f"  ME_ID length: {len(meid)} bytes")
+
+    print()
+    print("[Stage 2.5] Performing safe D0 READ16 probes...")
+
+    print()
+    print("Probe A: S-USBDL @ 0x0010043C")
+    susbdl_words, susbdl_raw, _, _ = read16_d0(
+        ep_out, ep_in,
+        0x0010043C,
+        1
+    )
+
+    print()
+    print("Probe B: g_da_verified containing halfword @ 0x0010935C")
+    print("NOTE: g_da_verified itself is byte address 0x0010935D.")
+    print("Reading aligned halfword 0x0010935C instead of issuing")
+    print("an unaligned READ16 directly at 0x0010935D.")
+    gdav_words, gdav_raw, _, _ = read16_d0(
+        ep_out, ep_in,
+        0x0010935C,
+        1
+    )
+
+    print()
+    print("Probe C: saved-LR alias @ 0x000C0AC8")
+    lr_words, lr_raw, _, _ = read16_d0(
+        ep_out, ep_in,
+        0x000C0AC8,
+        2
+    )
+
+    if len(lr_raw) == 4:
+        lr_be = int.from_bytes(lr_raw, "big")
+        print(
+            f"  32-bit concatenated wire value = "
+            f"0x{lr_be:08X}"
+        )
+
+    print()
+    print("D0 reconnaissance complete.")
+    print("No target-memory write command has been sent.")
+
+    print()
+    print("Known expected values from previous mtkclient sessions")
+    print("(NOT re-queried by this Stage 2 build yet):")
+    print("  HW subcode : 0x8A00")
+    print("  HW version : 0xCB00")
+    print("  SW version : 0x0002")
+    print()
+    print("These remain EXPECTED/REFERENCE values, not Stage-2 PASS results.")
+
+    print()
+    print("=" * 68)
+    print("STAGE 2 BOOTSTRAP SUCCESS")
+    print("=" * 68)
+    print("The proven Stage 1 session remains active.")
+    print("No D0, D3, DA, memory write, crash, or exploit command was sent.")
+    print()
+    print("Holding the same Preloader USB session.")
+    print("Press Ctrl+C to release it.")
+
+    start = time.monotonic()
+    last_second = -1
+
+    while True:
+        elapsed = time.monotonic() - start
+        sec = int(elapsed)
+
+        if sec != last_second:
+            last_second = sec
+            print(
+                f"[{stage1.ts():.6f}] "
+                f"Stage 2 session still held: {elapsed:.1f}s"
+            )
+
+        #
+        # Deliberately do NOT send a protocol keepalive.
+        #
+        # Stage 1 already proved that merely maintaining the legitimate
+        # Preloader session is sufficient to keep the device captured.
+        #
+        time.sleep(0.1)
+
+
+def main():
+    dev = None
+
+    print("T408DL_preloader_stage2.py")
+    print("Stage 2 using VERIFIED Stage 1 catcher")
+    print("=" * 68)
+    print()
+    print("IMPORTANT:")
+    print("  Do NOT run T408DL_preloader_catcher.py separately.")
+    print("  This program imports it and uses the same process/session.")
+    print()
+
+    try:
+        #
+        # ------------------------------------------------------------
+        # STAGE 1
+        # ------------------------------------------------------------
+        # These are the EXACT working catcher functions.
+        # We do not reproduce or modify their implementation here.
+        #
+        print("[Stage 1] Waiting for and capturing Preloader...")
+
+        dev = stage1.wait_for_preloader()
+
+        print("[Stage 1] Setting up proven USB path...")
+        intf, ep_out, ep_in = stage1.setup_usb(dev)
+
+        print("[Stage 1] Performing proven MTK synchronization...")
+        stage1.sync_mtk(ep_out, ep_in)
+
+        print("[Stage 1] Verifying device identity...")
+        hwcode, hwver = stage1.get_hw_code(ep_out, ep_in)
+
+        if hwcode != EXPECTED_HW_CODE:
+            raise RuntimeError(
+                f"Wrong device: expected HW_CODE 0x{EXPECTED_HW_CODE:04X}, "
+                f"got 0x{hwcode:04X}"
+            )
+
+        print()
+        print("************************************************************")
+        print("STAGE 1 VERIFIED")
+        print(f"HW_CODE = 0x{hwcode:04X}")
+        print("Same live USB session will now be passed directly to Stage 2.")
+        print("************************************************************")
+
+        #
+        # ------------------------------------------------------------
+        # STAGE 2
+        # ------------------------------------------------------------
+        #
+        stage2_readonly_recon(dev, ep_out, ep_in)
+
+    except KeyboardInterrupt:
+        print("\nStopping cleanly.")
+
+    except Exception as exc:
+        print()
+        print(f"ERROR: {exc}")
+        return 1
+
+    finally:
+        if dev is not None:
+            print("Releasing Preloader USB session...")
+            stage1.cleanup(dev)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
