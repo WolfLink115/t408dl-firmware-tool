@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import shlex
+import shutil
 import struct
 import sys
 import time
@@ -13,6 +16,7 @@ import T408DL_preloader_stage3c_susbdl_zero as s3c
 import T408DL_preloader_stage3e_wiko_stage1 as s3e
 import T408DL_preloader_stage3f_jump_wiko as s3f
 import T408DL_preloader_stage3g_xflash_sync as s3g
+import t408dl_storage as storage
 
 
 USB_TIMEOUT_MS = 5000
@@ -32,6 +36,9 @@ GET_PACKET_LENGTH = 0x040007
 
 # XFlash storage identifiers
 MTK_DA_STORAGE_EMMC = 1
+MTK_DA_EMMC_PART_BOOT1 = 1
+MTK_DA_EMMC_PART_BOOT2 = 2
+MTK_DA_EMMC_PART_RPMB = 3
 MTK_DA_EMMC_PART_USER = 8
 
 READ_ADDR = 0x00000400
@@ -356,70 +363,34 @@ def decode_emmc_info(data):
     print()
     print("[Decoded eMMC information]")
 
-    if len(data) < 96:
-        print(f"  Unexpected response length: {len(data)}")
-        print(f"  raw = {data.hex().upper()}")
-        return
+    info = storage.parse_emmc_info(data)
 
-    import struct
-
-    pos = 0
-
-    emmc_type, block_size = struct.unpack_from(
-        "<II", data, pos
-    )
-    pos += 8
-
-    (
-        boot1,
-        boot2,
-        rpmb,
-        gp1,
-        gp2,
-        gp3,
-        gp4,
-        user,
-    ) = struct.unpack_from(
-        "<QQQQQQQQ", data, pos
-    )
-    pos += 64
-
-    cid = data[pos:pos + 16]
-    pos += 16
-
-    fwver = struct.unpack_from(
-        "<Q", data, pos
-    )[0]
-
-    print(f"  type       = 0x{emmc_type:X}")
-    print(f"  block size = 0x{block_size:X}")
-
+    print(f"  type       = 0x{info['type']:X}")
+    print(f"  block size = 0x{info['block_size']:X}")
     print(
-        f"  Boot1      = 0x{boot1:X} "
-        f"({boot1 / 1024 / 1024:.2f} MiB)"
+        f"  Boot1      = 0x{info['boot1']:X} "
+        f"({info['boot1'] / 1024 / 1024:.2f} MiB)"
     )
     print(
-        f"  Boot2      = 0x{boot2:X} "
-        f"({boot2 / 1024 / 1024:.2f} MiB)"
+        f"  Boot2      = 0x{info['boot2']:X} "
+        f"({info['boot2'] / 1024 / 1024:.2f} MiB)"
     )
     print(
-        f"  RPMB       = 0x{rpmb:X} "
-        f"({rpmb / 1024 / 1024:.2f} MiB)"
+        f"  RPMB       = 0x{info['rpmb']:X} "
+        f"({info['rpmb'] / 1024 / 1024:.2f} MiB)"
     )
-
-    print(f"  GP1        = 0x{gp1:X}")
-    print(f"  GP2        = 0x{gp2:X}")
-    print(f"  GP3        = 0x{gp3:X}")
-    print(f"  GP4        = 0x{gp4:X}")
-
+    print(f"  GP1        = 0x{info['gp1']:X}")
+    print(f"  GP2        = 0x{info['gp2']:X}")
+    print(f"  GP3        = 0x{info['gp3']:X}")
+    print(f"  GP4        = 0x{info['gp4']:X}")
     print(
-        f"  USER       = 0x{user:X} "
-        f"({user / 1024 / 1024 / 1024:.3f} GiB)"
+        f"  USER       = 0x{info['user']:X} "
+        f"({info['user'] / 1024 / 1024 / 1024:.3f} GiB)"
     )
+    print(f"  CID        = {info['cid']}")
+    print(f"  FW version = 0x{info['fwver']:X}")
 
-    print(f"  CID        = {cid.hex().upper()}")
-    print(f"  FW version = 0x{fwver:X}")
-
+    return info
 
 
 
@@ -1117,6 +1088,178 @@ def read_emmc_range(ep_out, ep_in, addr, size, outfile, label):
 
 
 
+def read_emmc_area_stream(
+    ep_out,
+    ep_in,
+    addr,
+    size,
+    outfile,
+    label,
+    *,
+    emmc_part=MTK_DA_EMMC_PART_USER,
+    area_name="USER",
+    collect=False,
+    collision_safe=True,
+):
+    """Stream an XFlash READ_DATA transfer directly to disk.
+
+    This is the large-partition path used by named dumps, dump-firmware,
+    dump-all, and read-only Boot0/Boot1 access. It never buffers the entire
+    image unless collect=True is explicitly requested for a small structure.
+    """
+    if size <= 0:
+        raise RuntimeError("read size must be > 0")
+    if addr < 0:
+        raise RuntimeError("read address must be >= 0")
+    if addr & 0x1FF or size & 0x1FF:
+        raise RuntimeError("storage reads must be 512-byte aligned")
+
+    out = None
+    if outfile is not None:
+        out = Path(outfile)
+        if collision_safe:
+            out = storage.collision_safe_path(out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+    print()
+    print("=" * 72)
+    print(f"STREAMING STORAGE READ — {label}")
+    print("=" * 72)
+    print("  storage   = eMMC")
+    print(f"  area      = {area_name} (selector {emmc_part})")
+    print(f"  address   = 0x{addr:016X}")
+    print(f"  length    = 0x{size:X} ({size / 1024 / 1024:.2f} MiB)")
+    if out is not None:
+        print(f"  output    = {out}")
+    else:
+        print("  output    = memory-only")
+    print("  operation = READ-ONLY")
+
+    s3g.xsend(ep_out, READ_DATA)
+    st = s3g.read_status(ep_in)
+    if st != 0:
+        raise RuntimeError(f"{label}: READ_DATA rejected: 0x{st:08X}")
+
+    param = struct.pack(
+        "<IIQQIIIIIIII",
+        MTK_DA_STORAGE_EMMC,
+        emmc_part,
+        addr,
+        size,
+        0, 0, 0, 0, 0, 0, 0, 0,
+    )
+    s3g.xsend(ep_out, param)
+    st = s3g.read_status(ep_in)
+    if st != 0:
+        raise RuntimeError(f"{label}: parameter rejected: 0x{st:08X}")
+    st = s3g.read_status(ep_in)
+    if st != 0:
+        raise RuntimeError(f"{label}: read start rejected: 0x{st:08X}")
+
+    digest = hashlib.sha256()
+    gathered = bytearray() if collect else None
+    done = 0
+    started = time.monotonic()
+    next_report = min(size, 0x1000000)  # 16 MiB
+
+    partial = None
+    if out is not None:
+        partial = storage.collision_safe_path(out.with_name(out.name + ".partial"))
+    fh = partial.open("xb") if partial is not None else None
+    transfer_ok = False
+    try:
+        while done < size:
+            dtype, payload = read_xflash_raw_packet(ep_in)
+
+            if len(payload) == 4:
+                flag = struct.unpack("<I", payload)[0]
+                if flag != 0:
+                    raise RuntimeError(
+                        f"{label}: READ_DATA status 0x{flag:08X} "
+                        f"at 0x{done:X}/0x{size:X}"
+                    )
+                continue
+
+            remaining = size - done
+            if len(payload) > remaining:
+                raise RuntimeError(
+                    f"{label}: DA returned too much data: "
+                    f"0x{len(payload):X} > remaining 0x{remaining:X}"
+                )
+            if not payload:
+                raise RuntimeError(f"{label}: zero-length data payload")
+
+            if fh is not None:
+                fh.write(payload)
+            digest.update(payload)
+            if gathered is not None:
+                gathered.extend(payload)
+            done += len(payload)
+            send_ack_no_status(ep_out)
+
+            if done >= next_report or done == size:
+                elapsed = time.monotonic() - started
+                print(
+                    f"  received = 0x{done:X}/0x{size:X} "
+                    f"({done * 100.0 / size:.1f}%, {elapsed:.1f}s)"
+                )
+                while next_report <= done:
+                    next_report += 0x1000000
+
+        dtype, final_payload = read_xflash_raw_packet(ep_in)
+        if len(final_payload) != 4:
+            raise RuntimeError(
+                f"{label}: unexpected final packet length 0x{len(final_payload):X}"
+            )
+        final_status = struct.unpack("<I", final_payload)[0]
+        if final_status != 0:
+            raise RuntimeError(
+                f"{label}: final READ_DATA status 0x{final_status:08X}"
+            )
+        transfer_ok = True
+    except Exception:
+        if fh is not None:
+            fh.flush()
+        raise
+    finally:
+        if fh is not None:
+            fh.close()
+
+    if out is not None and partial is not None and transfer_ok:
+        partial.rename(out)
+
+    hexdigest = digest.hexdigest()
+    elapsed = time.monotonic() - started
+    print("  READ_DATA completion: PASS")
+    print(f"  SHA256 = {hexdigest}")
+    print(f"  time   = {elapsed:.3f}s")
+    if out is not None:
+        print(f"  file   = {out}")
+
+    return (
+        bytes(gathered) if gathered is not None else None,
+        hexdigest,
+        out,
+    )
+
+
+def read_emmc_bytes(ep_out, ep_in, addr, size, label, *, emmc_part=MTK_DA_EMMC_PART_USER, area_name="USER"):
+    data, digest, _ = read_emmc_area_stream(
+        ep_out,
+        ep_in,
+        addr,
+        size,
+        None,
+        label,
+        emmc_part=emmc_part,
+        area_name=area_name,
+        collect=True,
+        collision_safe=False,
+    )
+    return data, digest
+
+
+
 def _write_xflash_param_frame(ep_out, payload):
     """Write one framed XFlash parameter without consuming status."""
     hdr = struct.pack(
@@ -1219,290 +1362,76 @@ def get_write_packet_length(ep_out, ep_in):
 
 
 
-def get_live_gpt_partitions(ep_out, ep_in):
-    """
-    Read and validate the primary GPT directly from eMMC USER.
+def get_live_gpt_table(ep_out, ep_in, emmc_info=None, *, verbose=True):
+    """Read, CRC-validate, and parse the primary GPT from eMMC USER."""
+    if verbose:
+        print()
+        print("=" * 72)
+        print("LIVE GPT")
+        print("=" * 72)
 
-    Returns a dict keyed by byte start address:
-
-        {
-            start: {
-                "name": str,
-                "start": int,
-                "size": int,
-                "first_lba": int,
-                "last_lba": int,
-            }
-        }
-
-    WRITE_DATA is not involved.
-    """
-
-    import zlib
-
-    print()
-    print("=" * 72)
-    print("LIVE GPT WRITE-GUARD")
-    print("=" * 72)
-
-    # --------------------------------------------------------
-    # Primary GPT header: LBA 1
-    # --------------------------------------------------------
-
-    header, _ = read_emmc_range(
+    header, _ = read_emmc_bytes(
         ep_out,
         ep_in,
         0x200,
         0x200,
-        "backups/writeguard-gpt-header.bin",
         "live GPT header",
     )
 
     if header[:8] != b"EFI PART":
-        raise RuntimeError(
-            "Primary GPT signature is invalid; "
-            "WRITE REFUSED"
-        )
+        raise RuntimeError("Primary GPT signature is invalid")
 
-    header_size = struct.unpack_from(
-        "<I",
-        header,
-        0x0C,
-    )[0]
+    entries_lba = struct.unpack_from("<Q", header, 0x48)[0]
+    entry_count = struct.unpack_from("<I", header, 0x50)[0]
+    entry_size = struct.unpack_from("<I", header, 0x54)[0]
 
-    stored_header_crc = struct.unpack_from(
-        "<I",
-        header,
-        0x10,
-    )[0]
+    if entry_count <= 0 or entry_count > 4096:
+        raise RuntimeError(f"Suspicious GPT entry count {entry_count}")
+    if entry_size < 128 or entry_size > 1024 or (entry_size & 7):
+        raise RuntimeError(f"Suspicious GPT entry size 0x{entry_size:X}")
 
-    if (
-        header_size < 0x5C
-        or header_size > 0x200
-    ):
-        raise RuntimeError(
-            f"Suspicious GPT header size "
-            f"0x{header_size:X}"
-        )
-
-    check = bytearray(
-        header[:header_size]
-    )
-
-    struct.pack_into(
-        "<I",
-        check,
-        0x10,
-        0,
-    )
-
-    calculated_header_crc = (
-        zlib.crc32(check) & 0xFFFFFFFF
-    )
-
-    print()
-    print(
-        f"  header CRC stored = "
-        f"0x{stored_header_crc:08X}"
-    )
-    print(
-        f"  header CRC calc   = "
-        f"0x{calculated_header_crc:08X}"
-    )
-
-    if calculated_header_crc != stored_header_crc:
-        raise RuntimeError(
-            "Primary GPT header CRC mismatch; "
-            "WRITE REFUSED"
-        )
-
-    entries_lba = struct.unpack_from(
-        "<Q",
-        header,
-        0x48,
-    )[0]
-
-    entry_count = struct.unpack_from(
-        "<I",
-        header,
-        0x50,
-    )[0]
-
-    entry_size = struct.unpack_from(
-        "<I",
-        header,
-        0x54,
-    )[0]
-
-    stored_entries_crc = struct.unpack_from(
-        "<I",
-        header,
-        0x58,
-    )[0]
-
-    if (
-        entry_count <= 0
-        or entry_count > 4096
-    ):
-        raise RuntimeError(
-            f"Suspicious GPT entry count "
-            f"{entry_count}"
-        )
-
-    if (
-        entry_size < 128
-        or entry_size > 1024
-        or (entry_size & 7)
-    ):
-        raise RuntimeError(
-            f"Suspicious GPT entry size "
-            f"0x{entry_size:X}"
-        )
-
-    entries_len = (
-        entry_count * entry_size
-    )
-
-    entries_addr = (
-        entries_lba * 0x200
-    )
-
-    print(
-        f"  entries LBA       = "
-        f"0x{entries_lba:X}"
-    )
-    print(
-        f"  entries count     = "
-        f"{entry_count}"
-    )
-    print(
-        f"  entry size        = "
-        f"0x{entry_size:X}"
-    )
-    print(
-        f"  entries bytes     = "
-        f"0x{entries_len:X}"
-    )
-
-    # --------------------------------------------------------
-    # Partition entry array
-    # --------------------------------------------------------
-
-    entries, _ = read_emmc_range(
+    entries_len = entry_count * entry_size
+    entries_addr = entries_lba * 0x200
+    entries, _ = read_emmc_bytes(
         ep_out,
         ep_in,
         entries_addr,
         entries_len,
-        "backups/writeguard-gpt-entries.bin",
         "live GPT entries",
     )
 
-    calculated_entries_crc = (
-        zlib.crc32(entries) & 0xFFFFFFFF
+    user_size = None
+    if isinstance(emmc_info, dict):
+        user_size = emmc_info.get("user")
+
+    table = storage.parse_primary_gpt(
+        header,
+        entries,
+        block_size=0x200,
+        user_size=user_size,
     )
 
-    print()
-    print(
-        f"  entries CRC stored = "
-        f"0x{stored_entries_crc:08X}"
-    )
-    print(
-        f"  entries CRC calc   = "
-        f"0x{calculated_entries_crc:08X}"
-    )
+    if verbose:
+        print()
+        print(storage.format_gpt_table(table))
+        print("  GPT validation: PASS")
 
-    if calculated_entries_crc != stored_entries_crc:
-        raise RuntimeError(
-            "GPT partition-array CRC mismatch; "
-            "WRITE REFUSED"
-        )
+    return table
 
-    partitions = {}
 
-    for index in range(entry_count):
-        off = index * entry_size
-
-        ent = entries[
-            off:off + entry_size
-        ]
-
-        if len(ent) < 128:
-            break
-
-        type_guid = ent[:16]
-
-        if type_guid == b"\x00" * 16:
-            continue
-
-        first_lba = struct.unpack_from(
-            "<Q",
-            ent,
-            0x20,
-        )[0]
-
-        last_lba = struct.unpack_from(
-            "<Q",
-            ent,
-            0x28,
-        )[0]
-
-        if last_lba < first_lba:
-            raise RuntimeError(
-                f"GPT entry {index} has invalid "
-                f"LBA geometry"
-            )
-
-        name_raw = ent[
-            0x38:min(entry_size, 0x80)
-        ]
-
-        try:
-            name = (
-                name_raw
-                .decode(
-                    "utf-16le",
-                    errors="ignore",
-                )
-                .split("\x00", 1)[0]
-            )
-        except Exception:
-            name = ""
-
-        if not name:
-            name = f"gpt-entry-{index}"
-
-        start = first_lba * 0x200
-
-        size = (
-            last_lba
-            - first_lba
-            + 1
-        ) * 0x200
-
-        if start in partitions:
-            raise RuntimeError(
-                f"Duplicate GPT start address "
-                f"0x{start:X}; WRITE REFUSED"
-            )
-
-        partitions[start] = {
-            "name": name,
-            "start": start,
-            "size": size,
-            "first_lba": first_lba,
-            "last_lba": last_lba,
+def get_live_gpt_partitions(ep_out, ep_in, emmc_info=None):
+    """Compatibility map keyed by exact byte start address."""
+    table = get_live_gpt_table(ep_out, ep_in, emmc_info, verbose=True)
+    return {
+        p.start: {
+            "name": p.name,
+            "start": p.start,
+            "size": p.size,
+            "first_lba": p.first_lba,
+            "last_lba": p.last_lba,
         }
-
-    print()
-    print(
-        f"  populated partitions = "
-        f"{len(partitions)}"
-    )
-    print(
-        "  GPT validation: PASS"
-    )
-
-    return partitions
+        for p in table.partitions
+    }
 
 
 def validate_gpt_write_target(
@@ -1566,345 +1495,151 @@ def write_emmc_range_verify(
     part_size,
     image_path,
 ):
+    """Write one exact live-GPT USER partition and verify it by full SHA-256 readback.
 
-    # ------------------------------------------------------------
-    # LIVE GPT WRITE GUARD
-    # ------------------------------------------------------------
-
-    part = validate_gpt_write_target(
-        ep_out,
-        ep_in,
-        addr,
-        part_size,
-    )
-
+    The source file and readback are streamed; even large images such as super
+    are not loaded wholesale into RAM.
+    """
+    part = validate_gpt_write_target(ep_out, ep_in, addr, part_size)
     name = part["name"]
 
-    # ------------------------------------------------------------
-    # Image validation
-    # ------------------------------------------------------------
-
-
-    image = Path(
-        image_path
-    )
-
+    image = Path(image_path)
     if not image.is_file():
+        raise RuntimeError(f"image not found: {image}")
+
+    image_size = image.stat().st_size
+    if image_size != part_size:
         raise RuntimeError(
-            f"image not found: {image}"
+            f"{name}: image must be a full partition dump: "
+            f"0x{image_size:X} != 0x{part_size:X}"
         )
+    if image_size & 0x1FF:
+        raise RuntimeError(f"{name}: image is not 512-byte aligned")
 
-    raw = image.read_bytes()
-
-    # Our KEE7 donor images are full partition dumps.
-    # Require exact geometry so we never leave an old tail behind.
-    if len(raw) != part_size:
-        raise RuntimeError(
-            f"{name}: image must be a full "
-            f"partition dump: "
-            f"0x{len(raw):X} != "
-            f"0x{part_size:X}"
-        )
-
-    if len(raw) & 0x1FF:
-        raise RuntimeError(
-            f"{name}: image is not "
-            f"512-byte aligned"
-        )
-
-    source_sha = hashlib.sha256(
-        raw
-    ).hexdigest()
+    source_sha = storage.sha256_file(image)
 
     print()
     print("=" * 72)
-    print(
-        f"WRITE-VERIFY — {name}"
-    )
+    print(f"WRITE-VERIFY — {name}")
     print("=" * 72)
-
-    print(
-        f"  address        = "
-        f"0x{addr:016X}"
-    )
-    print(
-        f"  partition size = "
-        f"0x{part_size:X}"
-    )
-    print(
-        f"  image          = "
-        f"{image}"
-    )
-    print(
-        f"  image size     = "
-        f"0x{len(raw):X}"
-    )
-    print(
-        f"  source SHA256  = "
-        f"{source_sha}"
-    )
-
+    print(f"  address        = 0x{addr:016X}")
+    print(f"  partition size = 0x{part_size:X}")
+    print(f"  image          = {image}")
+    print(f"  image size     = 0x{image_size:X}")
+    print(f"  source SHA256  = {source_sha}")
     print()
-    print(
-        "  FORMAT = NOT IMPLEMENTED"
-    )
-    print(
-        "  ERASE  = NOT IMPLEMENTED"
-    )
+    print("  FORMAT = NOT IMPLEMENTED")
+    print("  ERASE  = NOT IMPLEMENTED")
+    print("  eMMC Boot0/Boot1/RPMB writes = DISABLED")
 
-    # ------------------------------------------------------------
-    # Per-partition manual arming
-    # ------------------------------------------------------------
-
-    safe_name = "".join(
-        ch if ch.isalnum() else "-"
-        for ch in name.upper()
-    ).strip("-")
-
-    expected_token = (
-        f"WRITE-{safe_name}"
-    )
-
-    token = input(
-        f"Type {expected_token} "
-        f"to arm this partition: "
-    ).strip()
-
+    safe_name = "".join(ch if ch.isalnum() else "-" for ch in name.upper()).strip("-")
+    expected_token = f"WRITE-{safe_name}"
+    token = input(f"Type {expected_token} to arm this partition: ").strip()
     if token != expected_token:
-        print(
-            "  confirmation mismatch; "
-            "write cancelled"
-        )
-
+        print("  confirmation mismatch; write cancelled")
         return False
 
-    # ------------------------------------------------------------
-    # Ask DA for its supported packet geometry.
-    # ------------------------------------------------------------
-
-    packet_len = get_write_packet_length(
-        ep_out,
-        ep_in,
-    )
-
-    # ------------------------------------------------------------
-    # WRITE_DATA command
-    # ------------------------------------------------------------
+    packet_len = get_write_packet_length(ep_out, ep_in)
 
     print()
-    print(
-        "[1] WRITE_DATA command"
-    )
-
-    s3g.xsend(
-        ep_out,
-        WRITE_DATA,
-    )
-
-    st = s3g.read_status(
-        ep_in,
-    )
-
-    print(
-        f"  command status = "
-        f"0x{st:08X}"
-    )
-
+    print("[1] WRITE_DATA command")
+    s3g.xsend(ep_out, WRITE_DATA)
+    st = s3g.read_status(ep_in)
+    print(f"  command status = 0x{st:08X}")
     if st != 0:
-        raise RuntimeError(
-            f"WRITE_DATA rejected: "
-            f"0x{st:08X}"
-        )
-
-    # ------------------------------------------------------------
-    # WRITE_DATA parameter
-    #
-    # storage = eMMC
-    # section = USER
-    # addr
-    # size
-    # 8 x NAND-extension fields = zero for eMMC
-    # ------------------------------------------------------------
+        raise RuntimeError(f"WRITE_DATA rejected: 0x{st:08X}")
 
     param = struct.pack(
         "<IIQQIIIIIIII",
-
         MTK_DA_STORAGE_EMMC,
         MTK_DA_EMMC_PART_USER,
-
         addr,
-        len(raw),
-
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
+        image_size,
+        0, 0, 0, 0, 0, 0, 0, 0,
     )
 
     print()
-    print(
-        "[2] WRITE_DATA parameters"
-    )
-
-    print(
-        f"  parameter size = "
-        f"0x{len(param):X}"
-    )
-
-    _send_param_group(
-        ep_out,
-        ep_in,
-        [param],
-        "write parameter",
-    )
-
-    # ------------------------------------------------------------
-    # Data transfer
-    #
-    # Each DA write chunk is represented as three XFlash params:
-    #
-    #   u32 0
-    #   u32 additive_checksum16
-    #   raw data
-    #
-    # Then one status acknowledges the whole parameter group.
-    # ------------------------------------------------------------
+    print("[2] WRITE_DATA parameters")
+    print(f"  parameter size = 0x{len(param):X}")
+    _send_param_group(ep_out, ep_in, [param], "write parameter")
 
     print()
-    print(
-        "[3] Sending flash data"
-    )
-
+    print("[3] Streaming flash data")
     pos = 0
     started = time.monotonic()
+    write_hash = hashlib.sha256()
 
-    while pos < len(raw):
-        chunk = raw[
-            pos:pos + packet_len
-        ]
-
-        if len(chunk) & 0x1FF:
-            raise RuntimeError(
-                f"internal error: "
-                f"chunk 0x{len(chunk):X} "
-                f"is not aligned"
+    with image.open("rb") as rf:
+        while pos < image_size:
+            want = min(packet_len, image_size - pos)
+            chunk = rf.read(want)
+            if len(chunk) != want:
+                raise RuntimeError(
+                    f"{name}: source file changed/short-read at 0x{pos:X}: "
+                    f"0x{len(chunk):X}/0x{want:X}"
+                )
+            if len(chunk) & 0x1FF:
+                raise RuntimeError(
+                    f"internal error: chunk 0x{len(chunk):X} is not 512-byte aligned"
+                )
+            checksum = sum(chunk) & 0xFFFF
+            _send_param_group(
+                ep_out,
+                ep_in,
+                [struct.pack("<I", 0), struct.pack("<I", checksum), chunk],
+                f"chunk@0x{pos:X}",
+            )
+            write_hash.update(chunk)
+            pos += len(chunk)
+            print(
+                f"  written = 0x{pos:X}/0x{image_size:X} "
+                f"({pos * 100.0 / image_size:.1f}%)"
             )
 
-        checksum = (
-            sum(chunk) & 0xFFFF
+    streamed_source_sha = write_hash.hexdigest()
+    if streamed_source_sha != source_sha:
+        raise RuntimeError(
+            f"{name}: source file changed while writing; "
+            f"pre-hash={source_sha} streamed-hash={streamed_source_sha}"
         )
-
-        _send_param_group(
-            ep_out,
-            ep_in,
-            [
-                struct.pack(
-                    "<I",
-                    0,
-                ),
-                struct.pack(
-                    "<I",
-                    checksum,
-                ),
-                chunk,
-            ],
-            f"chunk@0x{pos:X}",
-        )
-
-        pos += len(chunk)
-
-        print(
-            f"  written = "
-            f"0x{pos:X}/0x{len(raw):X} "
-            f"({pos * 100.0 / len(raw):.1f}%)"
-        )
-
-    # ------------------------------------------------------------
-    # Final write status
-    # ------------------------------------------------------------
 
     print()
-    print(
-        "[4] Final WRITE_DATA status"
-    )
-
-    st = s3g.read_status(
-        ep_in,
-    )
-
-    print(
-        f"  final status = "
-        f"0x{st:08X}"
-    )
-
+    print("[4] Final WRITE_DATA status")
+    st = s3g.read_status(ep_in)
+    print(f"  final status = 0x{st:08X}")
     if st != 0:
+        raise RuntimeError(f"{name}: final WRITE_DATA status 0x{st:08X}")
+    elapsed = time.monotonic() - started
+    print(f"  WRITE_DATA completion: PASS ({elapsed:.3f}s)")
+
+    print()
+    print("[5] Full streaming read-back verification")
+    verify_file = Path("backups") / f"readback-{name}-after-write.bin"
+    _, readback_sha, actual_verify_file = read_emmc_area_stream(
+        ep_out,
+        ep_in,
+        addr,
+        image_size,
+        verify_file,
+        f"{name} post-write verify",
+        emmc_part=MTK_DA_EMMC_PART_USER,
+        area_name="USER",
+        collect=False,
+        collision_safe=True,
+    )
+
+    print()
+    print(f"  source SHA256   = {source_sha}")
+    print(f"  readback SHA256 = {readback_sha}")
+    print(f"  readback file   = {actual_verify_file}")
+    if readback_sha != source_sha:
         raise RuntimeError(
-            f"{name}: final WRITE_DATA "
-            f"status 0x{st:08X}"
-        )
-
-    elapsed = (
-        time.monotonic()
-        - started
-    )
-
-    print(
-        f"  WRITE_DATA completion: "
-        f"PASS ({elapsed:.3f}s)"
-    )
-
-    # ------------------------------------------------------------
-    # Full read-back
-    # ------------------------------------------------------------
-
-    verify_file = Path(
-        f"backups/"
-        f"readback-{name}-after-write.bin"
-    )
-
-    print()
-    print(
-        "[5] Full read-back verification"
-    )
-
-    readback, readback_sha = (
-        read_emmc_range(
-            ep_out,
-            ep_in,
-            addr,
-            len(raw),
-            verify_file,
-            f"{name} post-write verify",
-        )
-    )
-
-    print()
-    print(
-        f"  source SHA256   = "
-        f"{source_sha}"
-    )
-    print(
-        f"  readback SHA256 = "
-        f"{readback_sha}"
-    )
-
-    if readback != raw:
-        raise RuntimeError(
-            f"{name}: READ-BACK MISMATCH — "
-            f"STOP. Do not write another "
-            f"partition."
+            f"{name}: READ-BACK SHA256 MISMATCH — STOP. "
+            "Do not write another partition."
         )
 
     print()
-    print(
-        f"  {name}: WRITE + FULL "
-        f"READ-BACK VERIFY = PASS"
-    )
-
+    print(f"  {name}: WRITE + FULL READ-BACK VERIFY = PASS")
     return True
 
 
@@ -2124,6 +1859,310 @@ def run_damage_sweep(ep_out, ep_in):
     )
 
 
+
+def _validate_user_read_bounds(addr, size, emmc_info):
+    if addr < 0 or size <= 0:
+        raise RuntimeError("address must be >= 0 and size must be > 0")
+    if addr & 0x1FF or size & 0x1FF:
+        raise RuntimeError("USER reads must be 512-byte aligned")
+    user_size = emmc_info.get("user") if isinstance(emmc_info, dict) else None
+    if user_size is not None and addr + size > user_size:
+        raise RuntimeError(
+            f"read end 0x{addr + size:X} exceeds eMMC USER size 0x{user_size:X}"
+        )
+
+
+def _partition_or_fail(table, name):
+    try:
+        return table.by_name(name)
+    except Exception as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def print_partition_info(part):
+    print()
+    print(f"Partition: {part.name}")
+    print(f"Index:     {part.index}")
+    print(f"Class:     {storage.classify_partition(part.name)}")
+    print(f"Start:     0x{part.start:016X}")
+    print(f"End:       0x{part.end:016X}")
+    print(f"Size:      0x{part.size:X} ({part.size / 1024 / 1024:.2f} MiB)")
+    print(f"First LBA: 0x{part.first_lba:X}")
+    print(f"Last LBA:  0x{part.last_lba:X}")
+
+
+def dump_named_partition(ep_out, ep_in, table, name, outfile=None):
+    part = _partition_or_fail(table, name)
+    if outfile is None:
+        outfile = f"{part.name}.bin"
+    return read_emmc_area_stream(
+        ep_out,
+        ep_in,
+        part.start,
+        part.size,
+        outfile,
+        f"partition {part.name}",
+        emmc_part=MTK_DA_EMMC_PART_USER,
+        area_name="USER",
+        collect=False,
+        collision_safe=True,
+    )
+
+
+def dump_hardware_area(ep_out, ep_in, emmc_info, which, outfile=None):
+    if not isinstance(emmc_info, dict):
+        raise RuntimeError("eMMC geometry is unavailable")
+
+    aliases = {
+        "boot0": (MTK_DA_EMMC_PART_BOOT1, "BOOT1", "boot1", "mmcblk0boot0.bin"),
+        "mmcblk0boot0": (MTK_DA_EMMC_PART_BOOT1, "BOOT1", "boot1", "mmcblk0boot0.bin"),
+        "boot1": (MTK_DA_EMMC_PART_BOOT2, "BOOT2", "boot2", "mmcblk0boot1.bin"),
+        "mmcblk0boot1": (MTK_DA_EMMC_PART_BOOT2, "BOOT2", "boot2", "mmcblk0boot1.bin"),
+    }
+    key = which.casefold()
+    if key not in aliases:
+        raise RuntimeError("dump-hw supports only boot0/mmcblk0boot0 and boot1/mmcblk0boot1")
+    selector, area_name, size_key, default_name = aliases[key]
+    size = int(emmc_info.get(size_key, 0) or 0)
+    if size <= 0:
+        raise RuntimeError(f"GET_EMMC_INFO reported zero size for {area_name}")
+    if outfile is None:
+        outfile = default_name
+
+    return read_emmc_area_stream(
+        ep_out,
+        ep_in,
+        0,
+        size,
+        outfile,
+        f"eMMC {area_name} ({default_name})",
+        emmc_part=selector,
+        area_name=area_name,
+        collect=False,
+        collision_safe=True,
+    )
+
+
+def dump_preloader_from_boot0(ep_out, ep_in, emmc_info, outfile):
+    if not isinstance(emmc_info, dict):
+        raise RuntimeError("eMMC geometry is unavailable")
+    size = int(emmc_info.get("boot1", 0) or 0)
+    if size <= 0:
+        raise RuntimeError("GET_EMMC_INFO reported zero BOOT1 size")
+    if size > 0x1000000:
+        raise RuntimeError(f"refusing unexpected BOOT1 size 0x{size:X}")
+
+    boot0, boot0_sha = read_emmc_bytes(
+        ep_out,
+        ep_in,
+        0,
+        size,
+        "eMMC BOOT1 preloader-layout read",
+        emmc_part=MTK_DA_EMMC_PART_BOOT1,
+        area_name="BOOT1/mmcblk0boot0",
+    )
+    info = storage.parse_preloader_from_boot0(boot0)
+    out = storage.collision_safe_path(Path(outfile))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(info["image"])
+
+    print()
+    print("PRELOADER EXTRACTION: PASS")
+    print(f"  boot0 SHA256     = {boot0_sha}")
+    print(f"  preloader offset = 0x{info['start']:X}")
+    print(f"  preloader length = 0x{info['length']:X}")
+    print(f"  preloader SHA256 = {info['sha256']}")
+    if info.get("embedded_name"):
+        print(f"  embedded name    = {info['embedded_name']}")
+    print(f"  output           = {out}")
+    return out, info
+
+
+def _write_dump_sidecars(root, table, emmc_info, records, *, include_device_id=False):
+    root = Path(root)
+    gpt_text = storage.format_gpt_table(table) + "\n"
+    (root / "GPT.txt").write_text(gpt_text, encoding="utf-8")
+
+    manifest_emmc = {
+        "block_size": emmc_info.get("block_size"),
+        "boot1_size": emmc_info.get("boot1"),
+        "boot2_size": emmc_info.get("boot2"),
+        "rpmb_size": emmc_info.get("rpmb"),
+        "user_size": emmc_info.get("user"),
+    }
+    if include_device_id:
+        manifest_emmc["cid"] = emmc_info.get("cid")
+        manifest_emmc["fwver"] = emmc_info.get("fwver")
+
+    manifest = {
+        "tool": "t408dl",
+        "note": "Images are preserved exactly as read; stock/modification state is not inferred.",
+        "emmc": manifest_emmc,
+        "gpt": {
+            "header_crc": f"0x{table.header_crc:08X}",
+            "entries_crc": f"0x{table.entries_crc:08X}",
+            "disk_guid": table.disk_guid,
+            "entry_count": table.entry_count,
+            "entry_size": table.entry_size,
+            "partitions": [p.as_dict() | {"class": storage.classify_partition(p.name)} for p in table.partitions],
+        },
+        "files": records,
+    }
+    storage.write_manifest(root / "manifest.json", manifest)
+
+    with (root / "SHA256SUMS").open("w", encoding="utf-8") as wf:
+        for rec in sorted(records, key=lambda r: r["path"]):
+            if rec.get("sha256") and rec.get("path"):
+                wf.write(f"{rec['sha256']}  {rec['path']}\n")
+
+
+def _save_primary_gpt_image(ep_out, ep_in, table, root):
+    end = table.entries_lba * 0x200 + table.entry_count * table.entry_size
+    length = (end + 0x1FF) & ~0x1FF
+    _, digest, out = read_emmc_area_stream(
+        ep_out,
+        ep_in,
+        0,
+        length,
+        Path(root) / "GPT.bin",
+        "primary GPT image",
+        emmc_part=MTK_DA_EMMC_PART_USER,
+        area_name="USER",
+        collect=False,
+        collision_safe=True,
+    )
+    return {
+        "kind": "gpt",
+        "path": str(out.relative_to(root)),
+        "sha256": digest,
+        "size": length,
+    }
+
+
+def dump_partition_collection(ep_out, ep_in, emmc_info, directory, *, firmware_only):
+    table = get_live_gpt_table(ep_out, ep_in, emmc_info, verbose=False)
+    root = storage.collision_safe_dir(Path(directory))
+    root.mkdir(parents=True, exist_ok=True)
+    print(f"Dump directory: {root}")
+
+    selected = []
+    for part in table.partitions:
+        category = storage.classify_partition(part.name)
+        if firmware_only:
+            if category == "firmware":
+                selected.append((part, category))
+        else:
+            selected.append((part, category))
+
+    total = sum(p.size for p, _ in selected)
+    hw_total = int(emmc_info.get("boot1", 0) or 0) + int(emmc_info.get("boot2", 0) or 0)
+    required = total + hw_total + 0x10000000  # 256 MiB working margin
+    free = shutil.disk_usage(root).free
+    print(
+        f"Selected {len(selected)} GPT partitions, total "
+        f"{total / 1024 / 1024 / 1024:.3f} GiB"
+    )
+    print(f"Free disk space: {free / 1024 / 1024 / 1024:.3f} GiB")
+    if free < required:
+        raise RuntimeError(
+            f"insufficient free space: need at least "
+            f"{required / 1024 / 1024 / 1024:.3f} GiB including safety margin"
+        )
+
+    if not firmware_only:
+        print("dump-all includes userdata/private/device-specific state.")
+        token = input("Type DUMP-ALL to continue: ").strip()
+        if token != "DUMP-ALL":
+            print("dump-all cancelled")
+            return None
+
+    records = []
+    records.append(_save_primary_gpt_image(ep_out, ep_in, table, root))
+
+    for part, category in selected:
+        subdir = root / category
+        subdir.mkdir(parents=True, exist_ok=True)
+        target = subdir / f"{part.name}.bin"
+        _, digest, actual = read_emmc_area_stream(
+            ep_out,
+            ep_in,
+            part.start,
+            part.size,
+            target,
+            f"partition {part.name}",
+            emmc_part=MTK_DA_EMMC_PART_USER,
+            area_name="USER",
+            collect=False,
+            collision_safe=True,
+        )
+        records.append({
+            "kind": "gpt-partition",
+            "partition": part.name,
+            "class": category,
+            "start": part.start,
+            "size": part.size,
+            "path": str(actual.relative_to(root)),
+            "sha256": digest,
+        })
+
+    # Full eMMC boot hardware areas are useful recovery material and are
+    # intentionally read-only. Include them in both firmware and full dumps.
+    hwdir = root / "hardware"
+    hwdir.mkdir(parents=True, exist_ok=True)
+    boot0_path = None
+    for alias in ("boot0", "boot1"):
+        default = "mmcblk0boot0.bin" if alias == "boot0" else "mmcblk0boot1.bin"
+        _, digest, actual = dump_hardware_area(
+            ep_out, ep_in, emmc_info, alias, hwdir / default
+        )
+        if alias == "boot0":
+            boot0_path = actual
+        records.append({
+            "kind": "emmc-hardware-area",
+            "area": alias,
+            "path": str(actual.relative_to(root)),
+            "size": actual.stat().st_size,
+            "sha256": digest,
+        })
+
+    # Extract from the already-preserved BOOT1/mmcblk0boot0 image. The parser
+    # deliberately fails closed unless EMMC_BOOT -> BRLYT -> MMM\x01 is
+    # self-consistent and advertises an in-range length.
+    try:
+        if boot0_path is None:
+            raise RuntimeError("mmcblk0boot0 dump is unavailable")
+        pre = storage.parse_preloader_from_boot0(boot0_path.read_bytes())
+        preloader_path = storage.collision_safe_path(hwdir / "preloader_raw.img")
+        preloader_path.write_bytes(pre["image"])
+        print("Preloader extraction from saved mmcblk0boot0: PASS")
+        print(f"  offset = 0x{pre['start']:X}")
+        print(f"  length = 0x{pre['length']:X}")
+        print(f"  SHA256 = {pre['sha256']}")
+        records.append({
+            "kind": "preloader",
+            "path": str(preloader_path.relative_to(root)),
+            "size": pre["length"],
+            "offset_in_mmcblk0boot0": pre["start"],
+            "embedded_name": pre.get("embedded_name"),
+            "sha256": pre["sha256"],
+        })
+    except Exception as exc:
+        print(f"Preloader extraction skipped/fail-closed: {exc}")
+
+    _write_dump_sidecars(
+        root,
+        table,
+        emmc_info,
+        records,
+        include_device_id=not firmware_only,
+    )
+    print()
+    print("Dump complete.")
+    print(f"  directory = {root}")
+    print(f"  manifest  = {root / 'manifest.json'}")
+    print(f"  hashes    = {root / 'SHA256SUMS'}")
+    return root
+
 def stage2_writeverify_shell(ep_out, ep_in, emmc_info=None):
     print()
     print("=" * 72)
@@ -2131,245 +2170,277 @@ def stage2_writeverify_shell(ep_out, ep_in, emmc_info=None):
     print("=" * 72)
     print()
     print("Persistent XFlash DA2 session is ACTIVE.")
-    print()
-    print("Available commands:")
-    print("  help")
-    print("  info")
-    print("  sweep")
-    print("  probe <addr> [len]")
-    print("  read <addr> <len> <outfile>")
-    print("  write-verify <addr> <partition_size> <image>")
-    print("  quit")
-    print()
-    print("Numeric values may be decimal or 0x-prefixed hexadecimal.")
+    print("Live-GPT partition operations and streaming dumps are available.")
+    print("Type 'help' for commands.")
     print()
     print("WRITE_DATA = ENABLED FOR EXACT LIVE GPT USER PARTITIONS")
+    print("BOOT0 / BOOT1 = READ-ONLY")
+    print("RPMB WRITE = DISABLED")
     print("FORMAT / ERASE = NOT IMPLEMENTED")
     print()
 
+    def show_help():
+        print()
+        print("Partition / GPT:")
+        print("  partitions")
+        print("      Read + CRC-validate the live GPT and list partitions.")
+        print("  gpt")
+        print("      Show validated GPT metadata and partition table.")
+        print("  partition-info <name>")
+        print("      Show exact live-GPT geometry for one partition.")
+        print("  dump <partition> [outfile]")
+        print("      Stream one GPT partition to disk by name.")
+        print("  flash <partition> <image>")
+        print("      Exact-size live-GPT guarded write + full SHA256 readback.")
+        print()
+        print("Bulk backup:")
+        print("  dump-firmware <directory>")
+        print("      Dump release-oriented firmware + Boot0/Boot1 + preloader.")
+        print("  dump-all <directory>")
+        print("      Dump all live GPT partitions (including private/userdata),")
+        print("      plus Boot0/Boot1. Requires DUMP-ALL confirmation.")
+        print()
+        print("Hardware areas (read-only):")
+        print("  dump-hw boot0 [outfile]")
+        print("      Dump Linux mmcblk0boot0 / eMMC BOOT1 selector 1.")
+        print("  dump-hw boot1 [outfile]")
+        print("      Dump Linux mmcblk0boot1 / eMMC BOOT2 selector 2.")
+        print("  dump-preloader [outfile]")
+        print("      Parse EMMC_BOOT -> BRLYT -> MMM\\x01 and extract preloader.")
+        print()
+        print("Advanced/raw read-only:")
+        print("  read-raw <addr> <len> <outfile>")
+        print("      Stream a 512-byte-aligned eMMC USER range.")
+        print("  probe <addr> [len]")
+        print("      Legacy small USER-area read + summary.")
+        print("  sweep")
+        print("      Legacy read-only sample sweep.")
+        print()
+        print("Compatibility aliases:")
+        print("  read <addr> <len> <outfile>")
+        print("  write-verify <addr> <partition_size> <image>")
+        print()
+        print("Session:")
+        print("  info")
+        print("  help")
+        print("  quit")
+        print()
+        print("Paths containing spaces may be quoted.")
+
     while True:
         try:
-            line = input(
-                "t408dl> "
-            ).strip()
-
+            line = input("t408dl> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
-            print("Leaving write-verify shell.")
+            print("Leaving recovery shell.")
             return
 
         if not line:
             continue
 
-        parts = line.split()
-
+        try:
+            parts = shlex.split(line)
+        except ValueError as exc:
+            print(f"Parse error: {exc}")
+            continue
+        if not parts:
+            continue
         cmd = parts[0].lower()
 
         try:
-            if cmd in (
-                "quit",
-                "exit",
-                "q",
-            ):
-                print(
-                    "Leaving write-verify shell."
-                )
+            if cmd in ("quit", "exit", "q"):
+                print("Leaving recovery shell.")
                 return
 
-            elif cmd in (
-                "help",
-                "?",
-            ):
-                print()
-                print("help")
-                print(
-                    "  Show this command list."
-                )
-                print()
-                print("info")
-                print(
-                    "  Show known eMMC / session information."
-                )
-                print()
-                print("sweep")
-                print(
-                    "  Sample important USER offsets and report "
-                    "DATA vs ZERO."
-                )
-                print()
-                print(
-                    "probe <addr> [len]"
-                )
-                print(
-                    "  Read and summarize memory. "
-                    "Default len = 0x200."
-                )
-                print()
-                print(
-                    "read <addr> <len> <outfile>"
-                )
-                print(
-                    "  Save an arbitrary USER-area range."
-                )
-                print()
-                print(
-                    "write-verify <addr> <partition_size> <image>"
-                )
-                print(
-                    "  Allow-listed write followed by "
-                    "full READ_DATA verification."
-                )
-                print()
-                print("quit")
-                print(
-                    "  Release the USB session and exit."
-                )
+            if cmd in ("help", "?"):
+                show_help()
+                continue
 
-            elif cmd == "info":
+            if cmd == "info":
                 print()
-                print(
-                    "SoC HW_CODE       = 0x0699"
-                )
-                print(
-                    "Storage           = eMMC"
-                )
-                print(
-                    "USER partition ID = 8"
-                )
-                print(
-                    "block size        = 0x200"
-                )
-                print(
-                    "USER size         = 0x3A3E00000"
-                )
-                print(
-                    "READ_DATA         = ENABLED"
-                )
-                print(
-                    "WRITE_DATA        = ENABLED (live GPT guarded)"
-                )
-                print(
-                    "FORMAT            = NOT IMPLEMENTED"
-                )
-                print(
-                    "ERASE             = NOT IMPLEMENTED"
-                )
+                print("SoC HW_CODE       = 0x0699")
+                print("Storage           = eMMC")
+                if isinstance(emmc_info, dict):
+                    print(f"block size        = 0x{emmc_info['block_size']:X}")
+                    print(f"USER size         = 0x{emmc_info['user']:X}")
+                    print(f"Boot0/BOOT1 size  = 0x{emmc_info['boot1']:X}")
+                    print(f"Boot1/BOOT2 size  = 0x{emmc_info['boot2']:X}")
+                    print(f"RPMB size         = 0x{emmc_info['rpmb']:X}")
+                    print(f"eMMC CID          = {emmc_info['cid']}")
+                print("USER partition ID = 8")
+                print("BOOT1 selector     = 1 (Linux mmcblk0boot0)")
+                print("BOOT2 selector     = 2 (Linux mmcblk0boot1)")
+                print("READ_DATA          = ENABLED")
+                print("WRITE_DATA         = ENABLED (live GPT USER only)")
+                print("Boot0/Boot1 write  = DISABLED")
+                print("RPMB write         = DISABLED")
+                print("FORMAT             = NOT IMPLEMENTED")
+                print("ERASE              = NOT IMPLEMENTED")
+                continue
 
-            elif cmd == "sweep":
-                run_damage_sweep(
-                    ep_out,
-                    ep_in,
-                )
+            if cmd in ("partitions", "gpt"):
+                table = get_live_gpt_table(ep_out, ep_in, emmc_info, verbose=False)
+                print()
+                print(storage.format_gpt_table(table))
+                continue
 
-            elif cmd == "probe":
-                if len(parts) not in (
-                    2,
-                    3,
-                ):
-                    print(
-                        "usage: probe <addr> [len]"
-                    )
+            if cmd == "partition-info":
+                if len(parts) != 2:
+                    print("usage: partition-info <name>")
                     continue
+                table = get_live_gpt_table(ep_out, ep_in, emmc_info, verbose=False)
+                print_partition_info(_partition_or_fail(table, parts[1]))
+                continue
 
-                addr = parse_int(
-                    parts[1]
-                )
-
-                size = (
-                    parse_int(parts[2])
-                    if len(parts) == 3
-                    else 0x200
-                )
-
-                if size <= 0:
-                    print(
-                        "length must be > 0"
-                    )
+            if cmd == "dump":
+                if len(parts) not in (2, 3):
+                    print("usage: dump <partition> [outfile]")
                     continue
-
-                readonly_probe(
-                    ep_out,
-                    ep_in,
-                    addr,
-                    size,
-                    f"shell probe @ 0x{addr:X}",
+                table = get_live_gpt_table(ep_out, ep_in, emmc_info, verbose=False)
+                part = _partition_or_fail(table, parts[1])
+                outfile = parts[2] if len(parts) == 3 else f"backups/dumps/{part.name}.bin"
+                _, digest, actual = dump_named_partition(
+                    ep_out, ep_in, table, part.name, outfile
                 )
+                print(f"Dumped {part.name} -> {actual}")
+                print(f"SHA256 {digest}")
+                continue
 
-            elif cmd == "read":
-                if len(parts) != 4:
-                    print(
-                        "usage: read <addr> <len> <outfile>"
-                    )
+            if cmd == "flash":
+                if len(parts) != 3:
+                    print("usage: flash <partition> <image>")
                     continue
-
-                addr = parse_int(
-                    parts[1]
-                )
-
-                size = parse_int(
-                    parts[2]
-                )
-
-                outfile = parts[3]
-
-                if size <= 0:
-                    print(
-                        "length must be > 0"
-                    )
-                    continue
-
-                read_emmc_range(
-                    ep_out,
-                    ep_in,
-                    addr,
-                    size,
-                    outfile,
-                    f"shell read @ 0x{addr:X}",
-                )
-
-            elif cmd == "write-verify":
-                if len(parts) != 4:
-                    print(
-                        "usage: write-verify "
-                        "<addr> <partition_size> <image>"
-                    )
-                    continue
-
-                addr = parse_int(
-                    parts[1]
-                )
-
-                part_size = parse_int(
-                    parts[2]
-                )
-
-                image = parts[3]
-
+                table = get_live_gpt_table(ep_out, ep_in, emmc_info, verbose=False)
+                part = _partition_or_fail(table, parts[1])
                 write_emmc_range_verify(
+                    ep_out, ep_in, part.start, part.size, parts[2]
+                )
+                continue
+
+            if cmd == "dump-firmware":
+                if len(parts) != 2:
+                    print("usage: dump-firmware <directory>")
+                    continue
+                dump_partition_collection(
+                    ep_out, ep_in, emmc_info, parts[1], firmware_only=True
+                )
+                continue
+
+            if cmd == "dump-all":
+                if len(parts) != 2:
+                    print("usage: dump-all <directory>")
+                    continue
+                dump_partition_collection(
+                    ep_out, ep_in, emmc_info, parts[1], firmware_only=False
+                )
+                continue
+
+            if cmd == "dump-hw":
+                if len(parts) not in (2, 3):
+                    print("usage: dump-hw <boot0|boot1> [outfile]")
+                    continue
+                alias = parts[1]
+                default = (
+                    "backups/hardware/mmcblk0boot0.bin"
+                    if alias.casefold() in ("boot0", "mmcblk0boot0")
+                    else "backups/hardware/mmcblk0boot1.bin"
+                )
+                outfile = parts[2] if len(parts) == 3 else default
+                _, digest, actual = dump_hardware_area(
+                    ep_out, ep_in, emmc_info, alias, outfile
+                )
+                print(f"Hardware-area dump -> {actual}")
+                print(f"SHA256 {digest}")
+                continue
+
+            if cmd == "dump-preloader":
+                if len(parts) not in (1, 2):
+                    print("usage: dump-preloader [outfile]")
+                    continue
+                outfile = parts[1] if len(parts) == 2 else "backups/hardware/preloader_raw.img"
+                dump_preloader_from_boot0(ep_out, ep_in, emmc_info, outfile)
+                continue
+
+            if cmd in ("read-raw", "read"):
+                if len(parts) != 4:
+                    print("usage: read-raw <addr> <len> <outfile>")
+                    continue
+                addr = parse_int(parts[1])
+                size = parse_int(parts[2])
+                _validate_user_read_bounds(addr, size, emmc_info)
+                _, digest, actual = read_emmc_area_stream(
                     ep_out,
                     ep_in,
                     addr,
-                    part_size,
-                    image,
+                    size,
+                    parts[3],
+                    f"raw USER read @ 0x{addr:X}",
+                    emmc_part=MTK_DA_EMMC_PART_USER,
+                    area_name="USER",
+                    collect=False,
+                    collision_safe=True,
                 )
+                print(f"Raw dump -> {actual}")
+                print(f"SHA256 {digest}")
+                continue
 
-            else:
-                print(
-                    f"Unknown command: {cmd}"
+            if cmd == "sweep":
+                run_damage_sweep(ep_out, ep_in)
+                continue
+
+            if cmd == "probe":
+                if len(parts) not in (2, 3):
+                    print("usage: probe <addr> [len]")
+                    continue
+                addr = parse_int(parts[1])
+                size = parse_int(parts[2]) if len(parts) == 3 else 0x200
+                _validate_user_read_bounds(addr, size, emmc_info)
+                # Preserve legacy probe behavior, but make the filename
+                # collision-safe so a second handset cannot overwrite the first.
+                target = storage.collision_safe_path(
+                    Path(f"backups/shell-probe-{addr:016X}-{size:X}.bin")
                 )
-                print(
-                    "Type 'help'."
+                data, digest, actual = read_emmc_area_stream(
+                    ep_out,
+                    ep_in,
+                    addr,
+                    size,
+                    target,
+                    f"shell probe @ 0x{addr:X}",
+                    emmc_part=MTK_DA_EMMC_PART_USER,
+                    area_name="USER",
+                    collect=True,
+                    collision_safe=False,
                 )
+                summary = summarize_blob(data)
+                print()
+                print("[PROBE SUMMARY]")
+                print(f"  file          = {actual}")
+                print(f"  SHA256        = {digest}")
+                print(f"  nonzero bytes = {summary['nonzero']}/{len(data)}")
+                first = summary['first_nonzero']
+                print(f"  first nonzero = {'NONE' if first is None else f'0x{first:X}'}")
+                print(f"  first32       = {data[:32].hex().upper()}")
+                continue
+
+            if cmd == "write-verify":
+                if len(parts) != 4:
+                    print("usage: write-verify <addr> <partition_size> <image>")
+                    continue
+                addr = parse_int(parts[1])
+                part_size = parse_int(parts[2])
+                write_emmc_range_verify(ep_out, ep_in, addr, part_size, parts[3])
+                continue
+
+            print(f"Unknown command: {cmd}")
+            print("Type 'help'.")
 
         except Exception as exc:
             print()
-            print(
-                f"COMMAND FAILED: {exc}"
-            )
-            print(
-                "USB session retained if the DA is still responsive."
-            )
+            print(f"COMMAND FAILED: {exc}")
+            print("USB session retained if the DA is still responsive.")
             print()
+
 
 def main():
     # Recovery-only DA pair:
@@ -2397,10 +2468,12 @@ def main():
     print("  - GPT-aware WRITE_DATA with full read-back verification")
     print()
     print("SAFETY BOUNDARY:")
-    print("  - eMMC USER-area GPT partitions only")
-    print("  - GPT geometry validated before guarded writes")
-    print("  - full-partition image size required for write-verify")
-    print("  - Boot0 / Boot1 / RPMB writes are NOT enabled")
+    print("  - eMMC USER-area writes only, exact live-GPT partitions")
+    print("  - GPT header + entry CRCs validated before named operations")
+    print("  - full-partition image size required for writes")
+    print("  - streaming reads/writes avoid whole-image RAM buffering")
+    print("  - Boot0 / Boot1 reads are enabled; their writes are DISABLED")
+    print("  - RPMB writes are DISABLED")
     print("  - FORMAT / ERASE are NOT implemented")
 
     stage2 = load_stage2()
@@ -2526,12 +2599,12 @@ def main():
             "GET_EMMC_INFO",
         )
 
-        decode_emmc_info(emmc)
+        emmc_info = decode_emmc_info(emmc)
 
         stage2_writeverify_shell(
             ep_out,
             ep_in,
-            emmc,
+            emmc_info,
         )
 
         print()
@@ -2545,13 +2618,13 @@ def main():
         )
 
         print(
-            "No storage-information command "
-            "was sent."
+            "Recovery shell exited; any storage operations above were "
+            "explicitly requested in the live session."
         )
 
         print(
-            "Two 2-MiB eMMC USER reads "
-            "was performed; no write was attempted."
+            "Boot0 / Boot1 / RPMB writes remain disabled; "
+            "FORMAT / ERASE remain unimplemented."
         )
 
         return 0

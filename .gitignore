@@ -1,34 +1,58 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+env/
 
-# Editor / temporary files
+# Editor / OS / temporary files
 *.swp
 *.swo
 *.tmp
 *~
 .DS_Store
+Thumbs.db
 
-# Device-specific backups
-backups/
+# Device-specific backups and generated dumps
+/backups/
 
-# Firmware images / dumps
-firmware/
-ota/stock/
-ota/KEE7
-ota/KEKA
+# Firmware / OTA assets
+/firmware/
+/ota/stock/
+/ota/KEE7
+/ota/KEKA
 
-# Download-agent binaries
-wiko-da/
+# Proprietary Download Agent binaries
+/wiko-da/
 
 # Raw research captures / logs
-research/logs/
-research/t408dl-live-lowmem.bin
+/research/logs/
+/research/t408dl-live-lowmem.bin
+
+# Common accidental root-level flash/dump outputs
+/*.img
+/*.raw
+/*.dump
+/*.bin
+/*.log
 
 # Archives
 *.tar
 *.tar.gz
+*.tar.bz2
 *.tar.xz
 *.tar.zst
 *.zip
+*.7z
+
+# Partial / temporary generated images
+*.partial
+*.part
+*.bak.tmp
